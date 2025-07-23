@@ -269,6 +269,14 @@ async def main() -> None:
         if check_mode:
             await sniper.check_once(only_new)
             return
+        
+        # --- Проверочный вывод при первом запуске ---
+        if os.getenv("INIT_DUMP_ALL", "true").lower() == "true":
+            gifts = await sniper.fetch_gifts()
+            logger.info(f"Initial dump ({len(gifts)} items):")
+            for g in gifts:
+                logger.info(f"  {g['title']} | {g['price']}⭐ | остаток: {g['supply']}")
+            logger.info("✅ initial dump done")
 
         while True:
             now = datetime.now(ZoneInfo("Europe/Moscow"))

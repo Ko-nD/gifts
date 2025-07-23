@@ -1,11 +1,4 @@
-# ── Основная Telegram‑библиотека (user‑бот) ──
-pyrogram[fast]==2.0.106     # [fast] подтянет tgcrypto для ускорения MTProto
-
-# ── Ускоренный крипто‑backend (если [fast] не используется) ──
-tgcrypto==1.2.5             # нужен Pyrogram для шифрования; ставится автоматом с [fast]
-
-# ── Загрузка переменных из .env ──
+pyrogram-fork==2.0.106.post1   # <– тот же интерфейс + gifts‑методы
+tgcrypto==1.2.5
 python-dotenv==1.0.0
-
-# ── Удобные логи ──
 loguru==0.7.2
