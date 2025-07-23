@@ -11,10 +11,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY gifts_sniper.py .
 RUN mkdir -p /app/data
 CMD ["python", "gifts_sniper.py"]
-
-docker run --rm giftsniper python - <<'PY'
-import pyrogram, inspect
-print("Pyrogram version:", pyrogram.__version__)
-print("get_available_gifts exists:",
-      hasattr(pyrogram.Client, "get_available_gifts"))
-PY
