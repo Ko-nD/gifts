@@ -1,4 +1,4 @@
-pyrofork==2.3.68           # Pyrogram fork with gifts support:contentReference[oaicite:5]{index=5}
-tgcrypto==1.2.5            # Cryptography library for Pyrogram (wheel available) 
+wheelhouse/pyrofork-2.3.68-py3-none-any.whl   # локальное колесо
+tgcrypto==1.2.5
 python-dotenv==1.0.0
 loguru==0.7.2
