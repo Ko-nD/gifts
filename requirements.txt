@@ -1,4 +1,4 @@
-git+https://github.com/pyrogram/pyrofork.git@v2.0.106#egg=pyrogram_fork
+https://github.com/pyrogram/pyrofork/archive/refs/tags/v2.0.106.tar.gz#egg=pyrogram_fork
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 loguru==0.7.2
