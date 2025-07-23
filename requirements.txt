@@ -1,5 +1,5 @@
 # форк Pyrogram c методом get_available_gifts()
-https://github.com/pyrogram/pyrofork/archive/refs/heads/master.zip#egg=pyrogram
+https://github.com/pyrogram/pyrofork/archive/refs/heads/main.zip#egg=pyrogram
 
 tgcrypto==1.2.5
 python-dotenv==1.0.0
