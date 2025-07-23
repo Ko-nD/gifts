@@ -1,32 +1,30 @@
-# ============================================================
-# GiftSniper Dockerfile
-#—
-#   • Base:  python 3.11‑slim
-#   • Workdir: /app          (как в прошлом образе)
-#   • Никаких .env внутрь   (переменные задаёте при docker run)
-# ============================================================
-
-# 1. Базовый образ
+# ------------------------------------------------------------
+# GiftSniper – минимальный образ (Python 3.11‑slim)
+# ------------------------------------------------------------
 FROM python:3.11-slim
 
-# 2. Рабочая директория
-WORKDIR /app                # → все COPY идут относительно /app
-
-# 3. Системные пакеты (для tgcrypto / wheel‑сборки)
+# 1. Системные зависимости для tgcrypto
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential gcc && \
     rm -rf /var/lib/apt/lists/*
 
-# 4. Зависимости
-COPY requirements.txt /app          # тот же приём, что в старом Dockerfile
+# 2. Рабочая директория
+WORKDIR /app
+
+# 3. Python‑зависимости
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Код бота
-COPY gifts_sniper.py /app           # если рядом есть другие *.py — копируйте аналогично
-#  └─ Не копируем .env — окружение задаётся снаружи
+# 4. Исходники бота
+COPY gifts_sniper.py .
 
-# 6. Папка для persistent‑данных (gifts.json)
+# 5. Каталог под persistent‑файлы
 RUN mkdir -p /app/data
+ENV PYTHONUNBUFFERED=1
+
+# 6. Некорневой пользователь (опционально)
+RUN useradd -m runner
+USER runner
 
 # 7. Запуск
 CMD ["python", "gifts_sniper.py"]
