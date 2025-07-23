@@ -1,6 +1,4 @@
-# форк Pyrogram c методом get_available_gifts()
-pyrogram @ https://github.com/pyrogram/pyrofork/archive/refs/heads/main.zip
-
+pyrogram @ git+https://github.com/pyrogram/pyrofork.git@main
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 loguru==0.7.2
