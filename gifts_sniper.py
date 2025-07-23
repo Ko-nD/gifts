@@ -43,11 +43,11 @@ ID_TO_BUY = int(os.getenv("ID_TO_BUY", 0))          # куда дарим
 
 BUY_GIFT = os.getenv("BUY_GIFT", "false").lower() == "true"
 
-PRICE_FROM = int(os.getenv("PRICE_LIMIT_FROM", 0))
-PRICE_TO   = int(os.getenv("PRICE_LIMIT_TO", 500))
+PRICE_FROM = int(os.getenv("PRICE_LIMIT_FROM", 500))
+PRICE_TO   = int(os.getenv("PRICE_LIMIT_TO", 50000))
 SUPPLY_FROM = int(os.getenv("SUPPLY_LIMIT_FROM", 1))
-SUPPLY_TO   = int(os.getenv("SUPPLY_LIMIT_TO", 50_000))
-GIFT_COUNT  = int(os.getenv("GIFT_COUNT_TO_BUY", 2))
+SUPPLY_TO   = int(os.getenv("SUPPLY_LIMIT_TO", 60_000))
+GIFT_COUNT  = int(os.getenv("GIFT_COUNT_TO_BUY", 3))
 
 POLL_SEC_MIN = int(os.getenv("POLL_INTERVAL_FROM", 8))
 POLL_SEC_MAX = int(os.getenv("POLL_INTERVAL_TO", 15))
@@ -62,8 +62,8 @@ DAY_BREAK_END_HOUR   = 14
 DAY_BREAK_VARIATION_MIN = 5
 DAY_BREAK_VARIATION_MAX = 20
 
-SLOW_PRICE_THRESHOLD  = 10
-SLOW_SUPPLY_THRESHOLD = 1_000
+SLOW_PRICE_THRESHOLD  = 1000
+SLOW_SUPPLY_THRESHOLD = 50_000
 
 STORAGE = Path("gifts.json")
 
