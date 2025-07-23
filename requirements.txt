@@ -1,4 +1,5 @@
-pyrogram @ git+https://github.com/pyrogram/pyrofork.git@main
+# указываем локальный файл (pep 508)
+pyrogram @ file:///app/pyrofork.zip
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 loguru==0.7.2
