@@ -1,4 +1,6 @@
-https://github.com/pyrogram/pyrofork/archive/refs/tags/v2.0.106.tar.gz#egg=pyrogram_fork
+# форк Pyrogram c методом get_available_gifts()
+https://github.com/pyrogram/pyrofork/archive/refs/heads/master.zip#egg=pyrogram
+
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 loguru==0.7.2
