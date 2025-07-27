@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from pyrogram import Client
-from pyrogram.errors import FloodWait, BadRequest, InternalServerError, PeerFlood
+from pyrogram.errors import FloodWait, BadRequest, InternalServerError, PeerFlood, AuthKeyDuplicated
 
 # ──────────────── Настройки «говорливости» ────────────────
 VERBOSE = True            # False → почти молчаливый режим
@@ -220,7 +220,7 @@ class GiftSniper:
             self._save_seen()
 
         if VERBOSE:
-            now_str = datetime.now().time().replace(microsecond=0)
+            now_str = datetime.now(ZoneInfo("Europe/Moscow")).time().replace(microsecond=0)
             if bought_smth:
                 print(f"[{now_str}] ✅ что-то купили")
             else:
@@ -251,57 +251,63 @@ async def main() -> None:
 
     sniper = GiftSniper(user, ID_TO_BUY)
 
-    async with user:
-        if check_mode:
-            await sniper.check_once(only_new)
-            return
+    try: 
+        async with user:
+            if check_mode:
+                await sniper.check_once(only_new)
+                return
 
-        # первый дамп
-        if os.getenv("INIT_DUMP_ALL", "true").lower() == "true":
-            gifts = await sniper.fetch_gifts()
-            print(f"Initial dump: {len(gifts)} подарков")
-            for g in gifts:
-                print(f"  {g['title']} | {g['price']}⭐ | остаток: {g['supply']}")
-            print("✅ init-dump done")
+            # первый дамп
+            if os.getenv("INIT_DUMP_ALL", "true").lower() == "true":
+                gifts = await sniper.fetch_gifts()
+                print(f"Initial dump: {len(gifts)} подарков")
+                for g in gifts:
+                    print(f"  {g['title']} | {g['price']}⭐ | остаток: {g['supply']}")
+                print("✅ init-dump done")
 
-        while True:
-            now = datetime.now(ZoneInfo("Europe/Moscow"))
+            while True:
+                now = datetime.now(ZoneInfo("Europe/Moscow"))
 
-            # ночной сон
-            if NIGHT_BREAK_START_HOUR <= now.hour < NIGHT_BREAK_END_HOUR:
-                wake = now.replace(hour=NIGHT_BREAK_END_HOUR, minute=0, second=0, microsecond=0)
-                wake += timedelta(minutes=random.randint(NIGHT_BREAK_VARIATION_MIN,
-                                                         NIGHT_BREAK_VARIATION_MAX))
-                if VERBOSE:
-                    total = int((wake - now).total_seconds())
-                    print(f"🌙 Ночной сон. До пробуждения {total//3600}ч {total%3600//60}м")
-                while (left := (wake - datetime.now(ZoneInfo('Europe/Moscow'))).total_seconds()) > 0:
-                    await asyncio.sleep(min(POLL_PRINT_EVERY, left))
+                # ночной сон
+                if NIGHT_BREAK_START_HOUR <= now.hour < NIGHT_BREAK_END_HOUR:
+                    wake = now.replace(hour=NIGHT_BREAK_END_HOUR, minute=0, second=0, microsecond=0)
+                    wake += timedelta(minutes=random.randint(NIGHT_BREAK_VARIATION_MIN,
+                                                            NIGHT_BREAK_VARIATION_MAX))
                     if VERBOSE:
-                        print(f"   ...спим ещё {int(left)//60} мин")
-                continue
+                        total = int((wake - now).total_seconds())
+                        print(f"🌙 Ночной сон. До пробуждения {total//3600}ч {total%3600//60}м")
+                    while (left := (wake - datetime.now(ZoneInfo('Europe/Moscow'))).total_seconds()) > 0:
+                        await asyncio.sleep(min(POLL_PRINT_EVERY, left))
+                        if VERBOSE:
+                            print(f"   ...спим ещё {int(left)//60} мин")
+                    continue
 
-            # обед
-            if DAY_BREAK_START_HOUR <= now.hour < DAY_BREAK_END_HOUR:
-                wake = now.replace(hour=DAY_BREAK_END_HOUR, minute=0, second=0, microsecond=0)
-                wake += timedelta(minutes=random.randint(DAY_BREAK_VARIATION_MIN,
-                                                         DAY_BREAK_VARIATION_MAX))
-                if VERBOSE:
-                    total = int((wake - now).total_seconds())
-                    print(f"☀️ Обеденный перерыв {total//60} мин")
-                while (left := (wake - datetime.now(ZoneInfo('Europe/Moscow'))).total_seconds()) > 0:
-                    await asyncio.sleep(min(POLL_PRINT_EVERY, left))
+                # обед
+                if DAY_BREAK_START_HOUR <= now.hour < DAY_BREAK_END_HOUR:
+                    wake = now.replace(hour=DAY_BREAK_END_HOUR, minute=0, second=0, microsecond=0)
+                    wake += timedelta(minutes=random.randint(DAY_BREAK_VARIATION_MIN,
+                                                            DAY_BREAK_VARIATION_MAX))
                     if VERBOSE:
-                        print(f"   ...обед ещё {int(left)//60} мин")
-                continue
+                        total = int((wake - now).total_seconds())
+                        print(f"☀️ Обеденный перерыв {total//60} мин")
+                    while (left := (wake - datetime.now(ZoneInfo('Europe/Moscow'))).total_seconds()) > 0:
+                        await asyncio.sleep(min(POLL_PRINT_EVERY, left))
+                        if VERBOSE:
+                            print(f"   ...обед ещё {int(left)//60} мин")
+                    continue
 
-            try:
-                await sniper.tick()
-            except Exception as exc:
-                print(f"[ERR] главный цикл: {exc}", file=sys.stderr)
+                try:
+                    await sniper.tick()
+                except Exception as exc:
+                    print(f"[ERR] главный цикл: {exc}", file=sys.stderr)
 
-            await asyncio.sleep(random.randint(POLL_SEC_MIN, POLL_SEC_MAX))
+                await asyncio.sleep(random.randint(POLL_SEC_MIN, POLL_SEC_MAX))
 
+    except AuthKeyDuplicated:
+        print("[FATAL] AuthKeyDuplicated ➜ та же сессия уже активна.")
+        print("Удалите *.session или задайте новую TG_SESSION и перезапустите.")
+        return
+    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
