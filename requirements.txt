@@ -1,3 +1,4 @@
 wheelhouse/pyrofork-2.3.68-py3-none-any.whl   # локальное колесо
 tgcrypto==1.2.5
 python-dotenv==1.0.0
+tzdata>=2024.1
