@@ -17,7 +17,7 @@ from pyrogram.errors import (AuthKeyDuplicated, BadRequest, FloodWait,
 # ───────────── настройки ─────────────
 VERBOSE               = True
 NO_NEW_EVERY_SEC      = 60
-POLL_MIN, POLL_MAX    = 25, 35
+POLL_MIN, POLL_MAX    = 10, 25
 KEEPALIVE_PERIOD      = 90
 WATCHDOG_PERIOD       = 300
 RECONNECT_TRIES       = 5
