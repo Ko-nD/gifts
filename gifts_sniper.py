@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# GiftSniper — VPS edition (no sleep)
+# GiftSniper — VPS edition (no sleep, dynamic watchdog)
 # - user session (MTProto) for all actions & purchases
 # - notifications via Bot API if available, fallback to user MTProto
-# - keepalive ping + watchdog reconnect
-# - hourly heartbeat & daily summary
+# - keepalive ping + dynamic watchdog reconnect
+# - hourly "no new gifts" alert & daily summary
 # - supports --check and --check-all
 
 from __future__ import annotations
 import argparse, asyncio, json, os, random, sys, urllib.parse, urllib.request, ssl
-from datetime import datetime, timedelta, time, date, timezone
+from datetime import datetime, timedelta, timezone, date, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,9 +25,8 @@ except Exception:
 
 # ────────── базовые настройки ──────────
 VERBOSE             = True
-NO_NEW_EVERY_SEC    = 60        # "новинок нет" не чаще раза в N секунд
+NO_NEW_EVERY_SEC    = 60        # в stdout "новинок нет" не чаще
 KEEPALIVE_PERIOD    = 90        # секунд
-WATCHDOG_PERIOD     = 300       # 5 минут без успешных RPC → reconnect
 RECONNECT_TRIES     = 5
 RECONNECT_PAUSE     = 3
 
@@ -65,7 +64,7 @@ NOTIFY_CHAT_ID  = (os.getenv("NOTIFY_CHAT_ID") or "").strip()
 def to_bool(s: Optional[str], default=True) -> bool:
     if s is None: return default
     return s.strip().lower() in ("1","true","yes","on")
-NOTIFY_HOURLY      = to_bool(os.getenv("NOTIFY_HOURLY"), True)
+NOTIFY_HOURLY      = to_bool(os.getenv("NOTIFY_HOURLY"), True)     # присылать "за час не было новинок"
 NOTIFY_DAILY       = to_bool(os.getenv("NOTIFY_DAILY"), True)
 NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), True)
 NOTIFY_ERRORS      = to_bool(os.getenv("NOTIFY_ERRORS"), True)
@@ -75,17 +74,29 @@ if not (API_ID and API_HASH): fatal("TG_API_ID / TG_API_HASH пусты")
 if not SESSION and not Path("TgAccount.session").exists(): fatal("нужен TG_SESSION или файл TgAccount.session")
 if BUY_GIFT and not ID_TO_BUY: fatal("ID_TO_BUY обязателен при BUY_GIFT=true")
 
+def compute_watchdog_period() -> int:
+    # Явное значение из .env имеет приоритет
+    env = os.getenv("WATCHDOG_PERIOD")
+    if env:
+        try:
+            v = int(env)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    # Авто: щедрый таймаут, чтобы не срабатывать ложно
+    return max(180, POLL_MAX * 4, KEEPALIVE_PERIOD * 2)
+
+WATCHDOG_PERIOD = compute_watchdog_period()
+
 # ────────── нотификатор ──────────
 class Notifier:
-    """Пытается отправить через Bot API; если не вышло → отправляет MTProto-юзером."""
+    """Сначала пытается Bot API; если не удалось — шлёт MTProto-юзером."""
     def __init__(self, bot_token: str, chat_id: str, cli: Client):
         self.bot_token = bot_token or ""
         self.chat_id   = chat_id or ""
         self.cli       = cli
-        # короткие таймауты, чтобы логи не мешали работе
         self.http_timeout = 2.5
-
-        # на некоторых VPS нужны «более добрые» SSL-опции
         self.ctx = ssl.create_default_context()
         self.ctx.check_hostname = True
 
@@ -93,18 +104,15 @@ class Notifier:
         text = text.strip()
         if not text:
             return True
-        # 1) Bot API (быстро и не блокирует основной контур)
         if self.bot_token and self.chat_id:
             ok = await asyncio.to_thread(self._send_botapi_blocking, text)
             if ok:
                 return True
-        # 2) fallback: MTProto от юзер-аккаунта
         if self.chat_id:
             try:
                 await self.cli.send_message(chat_id=int(self.chat_id), text=text, disable_web_page_preview=True)
                 return True
             except ValueError:
-                # может быть строковый юзернейм/peer — попробуем как есть
                 try:
                     await self.cli.send_message(chat_id=self.chat_id, text=text, disable_web_page_preview=True)
                     return True
@@ -117,13 +125,10 @@ class Notifier:
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
             data = urllib.parse.urlencode({
-                "chat_id": self.chat_id,
-                "text": text,
-                "disable_web_page_preview": "true",
+                "chat_id": self.chat_id, "text": text, "disable_web_page_preview": "true"
             }).encode()
             req = urllib.request.Request(url, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=self.http_timeout, context=self.ctx) as r:
-                # ждём только 2.5с и не парсим ответ во что-то сложное
                 return r.status == 200
         except Exception:
             return False
@@ -188,14 +193,13 @@ class GiftSniper:
             except (BadRequest, PeerFlood) as e:
                 print("[ERR] buy:", e); break
             except Exception as e:
-                # отдаём наверх — пусть main решит reconnect
                 raise e
         if bought:
             print(f"[BUY] {g['title']} ×{bought}")
         return bought
 
     async def tick(self, only_new: bool=False) -> Tuple[bool, bool]:
-        """Возвращает (было_покупок, были_новые)"""
+        """Возвращает (были_покупки, были_новые_подарки)"""
         gifts = await self._fetch()
         rare_i = 0
         bought = False
@@ -240,7 +244,6 @@ async def keepalive(cli: Client, touch_ok):
                     await cli.invoke(Ping(ping_id=random.randint(1, 1 << 31)))
                 touch_ok()
         except Exception as e:
-            # просто предупреждаем; watchdog займётся реконнектом
             print("[WARN] keepalive:", e)
         await asyncio.sleep(KEEPALIVE_PERIOD)
 
@@ -255,7 +258,6 @@ async def reconnect(cli: Client) -> bool:
             await asyncio.sleep(RECONNECT_PAUSE)
     return False
 
-# ────────── утилиты ──────────
 def midnight_msk(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -271,13 +273,15 @@ async def main():
 
     sniper = GiftSniper(cli)
 
-    # счётчики для отчётов
-    polls = 0
-    buys  = 0
-    reconnects = 0
+    # счётчики
+    polls = buys = reconnects = 0
     last_ok = now()
     last_heartbeat = now()
     day_anchor = midnight_msk(now())
+
+    # почасовая статистика
+    hour_anchor = now()
+    hour_polls = hour_buys = hour_new = 0
 
     def touch_ok():
         nonlocal last_ok
@@ -287,36 +291,21 @@ async def main():
 
     try:
         await cli.start()
-
-        # стартовые сообщения
-        await notifier.send(f"▶️ GiftSniper запущен ({fmt_d(now())} MSK)\n"
-                            f"poll={POLL_MIN}-{POLL_MAX}s, watchdog={WATCHDOG_PERIOD}s")
+        await notifier.send(
+            f"▶️ GiftSniper запущен ({fmt_d(now())} MSK)\n"
+            f"poll={POLL_MIN}-{POLL_MAX}s, keepalive={KEEPALIVE_PERIOD}s, watchdog={WATCHDOG_PERIOD}s (auto)"
+        )
 
         if args.check or args.check_all:
-            bought, _ = await sniper.tick(only_new=not args.check_all)
-            if bought:
-                await notifier.send("✅ Проверка: есть покупки.")
-            else:
-                await notifier.send("ℹ️ Проверка: покупок нет.")
+            bought, new = await sniper.tick(only_new=not args.check_all)
+            msg = "✅ Проверка: есть покупки." if bought else ("ℹ️ Проверка: есть новые, без покупок." if new else "ℹ️ Проверка: новинок нет.")
+            await notifier.send(msg)
             return
 
-        # первичный дамп (по желанию)
-        if os.getenv("INIT_DUMP_ALL", "true").lower() == "true":
-            try:
-                gifts = await sniper._fetch()
-                print(f"Initial dump: {len(gifts)} gifts")
-                for g in gifts:
-                    print(f"  {g['title']} | {g['price']}⭐ | left: {g['supply']}")
-                print("✅ init-dump done")
-                touch_ok()
-            except Exception as e:
-                print("[WARN] init dump failed:", e)
-
-        # фоновые задачи
         ka_task = asyncio.create_task(keepalive(cli, touch_ok))
 
         while True:
-            # watchdog
+            # dynamic watchdog
             if (now() - last_ok).seconds >= WATCHDOG_PERIOD:
                 print("[WARN] watchdog: stale connection, reconnecting…")
                 if await reconnect(cli):
@@ -333,12 +322,16 @@ async def main():
                     if NOTIFY_ERRORS:
                         await notifier.send("❗ Watchdog: не удалось переподключиться, попробуем позже.")
 
-            # тик
+            # основной тик
             try:
-                bought, _ = await sniper.tick()
+                bought, new = await sniper.tick()
                 polls += 1
+                hour_polls += 1
                 if bought:
                     buys += 1
+                    hour_buys += 1
+                if new:
+                    hour_new += 1
                 touch_ok()
             except (OSError, ConnectionError) as e:
                 print("[ERR] connection:", e)
@@ -360,22 +353,25 @@ async def main():
                 if NOTIFY_ERRORS:
                     await notifier.send(f"❗ Ошибка цикла: {e!r}")
 
-            # hourly heartbeat
-            if NOTIFY_HOURLY and (now() - last_heartbeat) >= timedelta(hours=1):
-                last_heartbeat = now()
-                await notifier.send(
-                    f"⏱️ Heartbeat {fmt_d(now())} MSK\n"
-                    f"polls={polls}, buys={buys}, reconnects={reconnects}"
-                )
+            # hourly: если не было новых подарков за прошедший час — шлём одно уведомление
+            if NOTIFY_HOURLY and (now() - hour_anchor) >= timedelta(hours=1):
+                if hour_new == 0:
+                    await notifier.send(
+                        f"🕐 За последний час новинок не было ({fmt_d(now())} MSK)\n"
+                        f"polls={hour_polls}, reconnects={reconnects}"
+                    )
+                # сброс почасовых счётчиков
+                hour_anchor = now()
+                hour_polls = hour_buys = hour_new = 0
 
-            # daily summary (в момент перехода через полночь МСК)
+            # daily summary
             if NOTIFY_DAILY and now() >= (day_anchor + timedelta(days=1)):
                 await notifier.send(
                     f"📊 Daily summary ({day_anchor.date()}): "
                     f"polls={polls}, buys={buys}, reconnects={reconnects}"
                 )
                 day_anchor = midnight_msk(now())
-                polls = buys = reconnects = 0  # обнулим на новый день
+                polls = buys = reconnects = 0
 
             await asyncio.sleep(random.randint(POLL_MIN, POLL_MAX))
 
