@@ -1,4 +1,5 @@
 *.ini
 *.session
 .env
+venv
 get_session.py
