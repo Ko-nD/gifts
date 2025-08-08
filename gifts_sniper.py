@@ -1,37 +1,39 @@
 #!/usr/bin/env python3
-# GiftSniper — VPS edition (no-sleep, notifier, watchdog)
+# GiftSniper — VPS edition (no sleep)
+# - user session (MTProto) for all actions & purchases
+# - notifications via Bot API if available, fallback to user MTProto
 # - keepalive ping + watchdog reconnect
-# - /check, /check-all modes
-# - Telegram notify via Bot API (hourly pulse, reconnects, errors)
+# - hourly heartbeat & daily summary
+# - supports --check and --check-all
 
 from __future__ import annotations
-import argparse, asyncio, json, os, random, sys
-from datetime import datetime, timedelta, timezone
+import argparse, asyncio, json, os, random, sys, urllib.parse, urllib.request, ssl
+from datetime import datetime, timedelta, time, date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import urllib.request, urllib.parse
 
 from dotenv import load_dotenv
 from pyrogram import Client
 from pyrogram.errors import (
-    AuthKeyDuplicated, BadRequest, FloodWait, InternalServerError, PeerFlood
+    AuthKeyDuplicated, BadRequest, FloodWait,
+    InternalServerError, PeerFlood
 )
 try:
     from pyrogram.raw.functions import Ping
 except Exception:
-    Ping = None
+    Ping = None  # fallback: no raw ping
 
-# ───── базовые настройки ─────
+# ────────── базовые настройки ──────────
 VERBOSE             = True
-NO_NEW_EVERY_SEC    = 60           # «новинок нет» — не чаще чем раз в N секунд
-KEEPALIVE_PERIOD    = 90           # ping каждые N сек
-WATCHDOG_PERIOD     = 600          # если 10+ мин нет успешных RPC → reconnect
+NO_NEW_EVERY_SEC    = 60        # "новинок нет" не чаще раза в N секунд
+KEEPALIVE_PERIOD    = 90        # секунд
+WATCHDOG_PERIOD     = 300       # 5 минут без успешных RPC → reconnect
 RECONNECT_TRIES     = 5
 RECONNECT_PAUSE     = 3
 
 STORAGE = Path("gifts.json")
 
-# ───── часовой пояс (МСК, без зависимости от tzdata) ─────
+# ────────── часовой пояс МСК ──────────
 def msk_tz():
     try:
         from zoneinfo import ZoneInfo
@@ -41,8 +43,9 @@ def msk_tz():
 MSK = msk_tz()
 now = lambda: datetime.now(MSK)
 fmt = lambda dt: dt.strftime("%H:%M:%S")
+fmt_d = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
 
-# ───── env ─────
+# ────────── env ──────────
 load_dotenv()
 API_ID   = int(os.getenv("TG_API_ID", 0))
 API_HASH = os.getenv("TG_API_HASH", "")
@@ -56,74 +59,76 @@ S_FROM, S_TO = int(os.getenv("SUPPLY_LIMIT_FROM", 1)),   int(os.getenv("SUPPLY_L
 
 POLL_MIN, POLL_MAX = int(os.getenv("POLL_INTERVAL_FROM", 25)), int(os.getenv("POLL_INTERVAL_TO", 35))
 
-# notifier env (не обязателен)
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "").strip()
-NOTIFY_CHAT_ID   = os.getenv("NOTIFY_CHAT_ID", "").strip()
-NOTIFY_HOURLY    = os.getenv("NOTIFY_HOURLY", "true").lower() == "true"
-NOTIFY_DAILY     = os.getenv("NOTIFY_DAILY",  "true").lower() == "true"
-NOTIFY_RECONNECT = os.getenv("NOTIFY_RECONNECT","true").lower() == "true"
-NOTIFY_ERRORS    = os.getenv("NOTIFY_ERRORS", "true").lower() == "true"
+BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()
+NOTIFY_CHAT_ID  = (os.getenv("NOTIFY_CHAT_ID") or "").strip()
+
+def to_bool(s: Optional[str], default=True) -> bool:
+    if s is None: return default
+    return s.strip().lower() in ("1","true","yes","on")
+NOTIFY_HOURLY      = to_bool(os.getenv("NOTIFY_HOURLY"), True)
+NOTIFY_DAILY       = to_bool(os.getenv("NOTIFY_DAILY"), True)
+NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), True)
+NOTIFY_ERRORS      = to_bool(os.getenv("NOTIFY_ERRORS"), True)
 
 def fatal(msg): print("[FATAL]", msg); sys.exit(1)
 if not (API_ID and API_HASH): fatal("TG_API_ID / TG_API_HASH пусты")
 if not SESSION and not Path("TgAccount.session").exists(): fatal("нужен TG_SESSION или файл TgAccount.session")
 if BUY_GIFT and not ID_TO_BUY: fatal("ID_TO_BUY обязателен при BUY_GIFT=true")
 
-# ───── простая отправка в TG через Bot API ─────
-async def tg_notify(text: str, parse_mode: str = "HTML") -> bool:
-    token = BOT_TOKEN
-    chat  = NOTIFY_CHAT_ID
-    if not token or not chat:
+# ────────── нотификатор ──────────
+class Notifier:
+    """Пытается отправить через Bot API; если не вышло → отправляет MTProto-юзером."""
+    def __init__(self, bot_token: str, chat_id: str, cli: Client):
+        self.bot_token = bot_token or ""
+        self.chat_id   = chat_id or ""
+        self.cli       = cli
+        # короткие таймауты, чтобы логи не мешали работе
+        self.http_timeout = 2.5
+
+        # на некоторых VPS нужны «более добрые» SSL-опции
+        self.ctx = ssl.create_default_context()
+        self.ctx.check_hostname = True
+
+    async def send(self, text: str) -> bool:
+        text = text.strip()
+        if not text:
+            return True
+        # 1) Bot API (быстро и не блокирует основной контур)
+        if self.bot_token and self.chat_id:
+            ok = await asyncio.to_thread(self._send_botapi_blocking, text)
+            if ok:
+                return True
+        # 2) fallback: MTProto от юзер-аккаунта
+        if self.chat_id:
+            try:
+                await self.cli.send_message(chat_id=int(self.chat_id), text=text, disable_web_page_preview=True)
+                return True
+            except ValueError:
+                # может быть строковый юзернейм/peer — попробуем как есть
+                try:
+                    await self.cli.send_message(chat_id=self.chat_id, text=text, disable_web_page_preview=True)
+                    return True
+                except Exception as e:
+                    if VERBOSE:
+                        print("[WARN] notify MTProto failed:", e)
         return False
 
-    url  = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": "true"
-    }).encode()
+    def _send_botapi_blocking(self, text: str) -> bool:
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = urllib.parse.urlencode({
+                "chat_id": self.chat_id,
+                "text": text,
+                "disable_web_page_preview": "true",
+            }).encode()
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=self.http_timeout, context=self.ctx) as r:
+                # ждём только 2.5с и не парсим ответ во что-то сложное
+                return r.status == 200
+        except Exception:
+            return False
 
-    def _do_req():
-        req = urllib.request.Request(url, data=data, headers={
-            "Content-Type": "application/x-www-form-urlencoded"
-        })
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status == 200
-
-    try:
-        ok = await asyncio.to_thread(_do_req)
-        if not ok:
-            print("[WARN] notify: HTTP not OK")
-        return ok
-    except Exception as e:
-        print("[WARN] notify failed:", e)
-        return False
-
-# ───── учёт статистики ─────
-class Stats:
-    def __init__(self) -> None:
-        self.fetch_ok = 0
-        self.fetch_err = 0
-        self.buys = 0
-        self.reconnects = 0
-        self.last_buy: Optional[datetime] = None
-        self.last_new: Optional[datetime] = None
-
-    def snapshot(self) -> str:
-        parts = [
-            f"fetch_ok={self.fetch_ok}",
-            f"fetch_err={self.fetch_err}",
-            f"buys={self.buys}",
-            f"reconnects={self.reconnects}",
-            f"last_buy={fmt(self.last_buy) if self.last_buy else '—'}",
-            f"last_new={fmt(self.last_new) if self.last_new else '—'}",
-        ]
-        return " | ".join(parts)
-
-STATS = Stats()
-
-# ───── код снайпера ─────
+# ────────── снайпер ──────────
 class GiftSniper:
     def __init__(self, cli: Client):
         self.u = cli
@@ -159,14 +164,9 @@ class GiftSniper:
         raw = None
         try:
             raw = await self.u.get_available_gifts()
-            STATS.fetch_ok += 1
         except InternalServerError:
             await asyncio.sleep(1)
             raw = await self.u.get_available_gifts()
-            STATS.fetch_ok += 1
-        except Exception as e:
-            STATS.fetch_err += 1
-            raise e
         gifts = [self._norm(x) for x in (raw or [])]
         gifts.sort(key=lambda x: x["supply"] if x["supply"] is not None else float("inf"))
         return gifts
@@ -191,8 +191,6 @@ class GiftSniper:
                 # отдаём наверх — пусть main решит reconnect
                 raise e
         if bought:
-            STATS.buys += bought
-            STATS.last_buy = now()
             print(f"[BUY] {g['title']} ×{bought}")
         return bought
 
@@ -222,26 +220,27 @@ class GiftSniper:
                     bought = True
 
         if new:
-            STATS.last_new = now()
             STORAGE.write_text(json.dumps(sorted(self.seen), ensure_ascii=False, indent=2))
 
         if VERBOSE:
             t = fmt(now())
             if bought:
-                print(f"[{t}] ✅ купили")
+                print(f"[{t}] ✅ купили"); self._last_no_new = now()
             elif (self._last_no_new is None or (now() - self._last_no_new).seconds >= NO_NEW_EVERY_SEC):
                 print(f"[{t}] — новинок нет"); self._last_no_new = now()
 
         return bought, new
 
-# ───── keepalive & watchdog ─────
+# ────────── keepalive & reconnect ──────────
 async def keepalive(cli: Client, touch_ok):
     while True:
         try:
-            if Ping is not None:
-                await cli.invoke(Ping(ping_id=random.randint(1, 1 << 31)))
+            if getattr(cli, "is_connected", False):
+                if Ping is not None:
+                    await cli.invoke(Ping(ping_id=random.randint(1, 1 << 31)))
                 touch_ok()
         except Exception as e:
+            # просто предупреждаем; watchdog займётся реконнектом
             print("[WARN] keepalive:", e)
         await asyncio.sleep(KEEPALIVE_PERIOD)
 
@@ -250,35 +249,17 @@ async def reconnect(cli: Client) -> bool:
         try:
             await cli.stop(); await asyncio.sleep(1); await cli.start()
             print(f"[INFO] reconnect ok #{n}")
-            STATS.reconnects += 1
             return True
         except Exception as e:
             print(f"[WARN] reconnect #{n} fail:", e)
             await asyncio.sleep(RECONNECT_PAUSE)
     return False
 
-async def hourly_pulse():
-    while True:
-        if NOTIFY_HOURLY:
-            msg = f"⏱️ Hourly pulse\n{STATS.snapshot()}"
-            await tg_notify(msg)
-        await asyncio.sleep(3600)
+# ────────── утилиты ──────────
+def midnight_msk(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-def seconds_until(hour: int, minute: int) -> int:
-    n = now()
-    target = n.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= n:
-        target += timedelta(days=1)
-    return int((target - n).total_seconds())
-
-async def daily_summary():
-    while True:
-        await asyncio.sleep(seconds_until(23, 59))
-        if NOTIFY_DAILY:
-            msg = f"📊 Daily summary\n{STATS.snapshot()}"
-            await tg_notify(msg)
-
-# ───── main ─────
+# ────────── main ──────────
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="однократная проверка новых")
@@ -287,24 +268,39 @@ async def main():
 
     cli = Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION) \
           if SESSION else Client("TgAccount", api_id=API_ID, api_hash=API_HASH)
+
     sniper = GiftSniper(cli)
 
+    # счётчики для отчётов
+    polls = 0
+    buys  = 0
+    reconnects = 0
     last_ok = now()
+    last_heartbeat = now()
+    day_anchor = midnight_msk(now())
+
     def touch_ok():
         nonlocal last_ok
         last_ok = now()
 
+    notifier = Notifier(BOT_TOKEN, NOTIFY_CHAT_ID, cli)
+
     try:
         await cli.start()
 
-        # приветное уведомление, чтобы проверить BOT_TOKEN/чат
-        await tg_notify("✅ GiftSniper started")
+        # стартовые сообщения
+        await notifier.send(f"▶️ GiftSniper запущен ({fmt_d(now())} MSK)\n"
+                            f"poll={POLL_MIN}-{POLL_MAX}s, watchdog={WATCHDOG_PERIOD}s")
 
         if args.check or args.check_all:
-            await sniper.tick(only_new=not args.check_all)
+            bought, _ = await sniper.tick(only_new=not args.check_all)
+            if bought:
+                await notifier.send("✅ Проверка: есть покупки.")
+            else:
+                await notifier.send("ℹ️ Проверка: покупок нет.")
             return
 
-        # init dump (по желанию)
+        # первичный дамп (по желанию)
         if os.getenv("INIT_DUMP_ALL", "true").lower() == "true":
             try:
                 gifts = await sniper._fetch()
@@ -315,51 +311,71 @@ async def main():
                 touch_ok()
             except Exception as e:
                 print("[WARN] init dump failed:", e)
-                if NOTIFY_ERRORS:
-                    await tg_notify(f"⚠️ Init dump failed: <code>{e}</code>")
 
         # фоновые задачи
         ka_task = asyncio.create_task(keepalive(cli, touch_ok))
-        hp_task = asyncio.create_task(hourly_pulse())
-        ds_task = asyncio.create_task(daily_summary())
 
         while True:
             # watchdog
             if (now() - last_ok).seconds >= WATCHDOG_PERIOD:
                 print("[WARN] watchdog: stale connection, reconnecting…")
-                if NOTIFY_RECONNECT:
-                    await tg_notify("♻️ Watchdog: reconnecting…")
-                if not await reconnect(cli):
-                    print("[ERR] watchdog: reconnect failed; retry later")
-                    if NOTIFY_ERRORS:
-                        await tg_notify("❌ Watchdog: reconnect failed")
-                else:
+                if await reconnect(cli):
+                    reconnects += 1
                     touch_ok()
-                    # перезапуск keepalive
+                    if NOTIFY_RECONNECT:
+                        await notifier.send("♻️ Watchdog: переподключились.")
                     try:
                         ka_task.cancel()
                     except Exception:
                         pass
                     ka_task = asyncio.create_task(keepalive(cli, touch_ok))
+                else:
+                    if NOTIFY_ERRORS:
+                        await notifier.send("❗ Watchdog: не удалось переподключиться, попробуем позже.")
 
+            # тик
             try:
-                await sniper.tick()
+                bought, _ = await sniper.tick()
+                polls += 1
+                if bought:
+                    buys += 1
                 touch_ok()
             except (OSError, ConnectionError) as e:
                 print("[ERR] connection:", e)
-                if NOTIFY_RECONNECT:
-                    await tg_notify(f"♻️ Connection error → reconnect: <code>{e}</code>")
                 if await reconnect(cli):
+                    reconnects += 1
                     touch_ok()
+                    if NOTIFY_RECONNECT:
+                        await notifier.send("♻️ Reconnect после сетевой ошибки.")
                     try:
                         ka_task.cancel()
                     except Exception:
                         pass
                     ka_task = asyncio.create_task(keepalive(cli, touch_ok))
                 else:
-                    print("[ERR] reconnect failed; will retry after sleep")
                     if NOTIFY_ERRORS:
-                        await tg_notify("❌ Reconnect failed; will retry")
+                        await notifier.send("❗ Reconnect после сетевой ошибки не удался.")
+            except Exception as e:
+                print("[ERR] main:", e)
+                if NOTIFY_ERRORS:
+                    await notifier.send(f"❗ Ошибка цикла: {e!r}")
+
+            # hourly heartbeat
+            if NOTIFY_HOURLY and (now() - last_heartbeat) >= timedelta(hours=1):
+                last_heartbeat = now()
+                await notifier.send(
+                    f"⏱️ Heartbeat {fmt_d(now())} MSK\n"
+                    f"polls={polls}, buys={buys}, reconnects={reconnects}"
+                )
+
+            # daily summary (в момент перехода через полночь МСК)
+            if NOTIFY_DAILY and now() >= (day_anchor + timedelta(days=1)):
+                await notifier.send(
+                    f"📊 Daily summary ({day_anchor.date()}): "
+                    f"polls={polls}, buys={buys}, reconnects={reconnects}"
+                )
+                day_anchor = midnight_msk(now())
+                polls = buys = reconnects = 0  # обнулим на новый день
 
             await asyncio.sleep(random.randint(POLL_MIN, POLL_MAX))
 
@@ -372,7 +388,6 @@ async def main():
             pass
 
 if __name__ == "__main__":
-    # важное: без буферизации (см. unit-файл тоже)
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
