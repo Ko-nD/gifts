@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-# GiftSniper — VPS edition (premium-aware, per-user caps, robust reconnect, throttled alerts)
-# - учитывает поля: per_user_remains / limited_per_user / per_user_total / require_premium
-# - НЕ завязан на Bot API (покупки идут через MTProto); уведомления опциональны
-# - метрика "fetch_ok_*" = количество УСПЕШНЫХ get_available_gifts()
-
+# GiftSniper — VPS edition (hourly burst 59..05, premium-aware, per-user caps, robust reconnect)
 from __future__ import annotations
 import argparse, asyncio, json, os, random, sys, ssl, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone, date, time
@@ -15,22 +11,21 @@ from pyrogram import Client
 from pyrogram.errors import AuthKeyDuplicated, BadRequest, FloodWait, InternalServerError, PeerFlood
 
 try:
-    # В PyroFork есть raw Ping; используем если доступен
     from pyrogram.raw.functions import Ping
 except Exception:
     Ping = None
 
-# ───────────── базовые настройки ─────────────
+# ── базовые настройки ──
 VERBOSE             = True
-NO_NEW_EVERY_SEC    = 60            # «новинок нет» — не чаще
-KEEPALIVE_PERIOD    = 90            # сек
-RECONNECT_TRIES     = 5             # попыток soft/hard reconnect
-RECONNECT_PAUSE     = 3             # пауза между попытками
-SAFE_NOTIFY_TIMEOUT = float(os.getenv("NOTIFY_TIMEOUT", "2.5"))  # таймаут отправки уведомлений (сек)
+NO_NEW_EVERY_SEC    = 60        # «новинок нет» — не чаще
+KEEPALIVE_PERIOD    = 90        # сек
+RECONNECT_TRIES     = 5
+RECONNECT_PAUSE     = 3         # сек
+SAFE_NOTIFY_TIMEOUT = float(os.getenv("NOTIFY_TIMEOUT", "2.5"))
 
 STORAGE = Path("gifts.json")
 
-# ───────────── время / MSK ─────────────
+# ── время (MSK) ──
 def msk_tz():
     try:
         from zoneinfo import ZoneInfo
@@ -42,11 +37,11 @@ now = lambda: datetime.now(MSK)
 fmt = lambda dt: dt.strftime("%H:%M:%S")
 fmt_d = lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S")
 
-# ───────────── окружение ─────────────
+# ── окружение ──
 load_dotenv()
 API_ID   = int(os.getenv("TG_API_ID", 0))
 API_HASH = os.getenv("TG_API_HASH", "")
-SESSION  = os.getenv("TG_SESSION") or None   # если пусто — будет файл TgAccount.session
+SESSION  = os.getenv("TG_SESSION") or None
 
 ID_TO_BUY = int(os.getenv("ID_TO_BUY", 0))
 BUY_GIFT  = os.getenv("BUY_GIFT", "false").lower() == "true"
@@ -54,28 +49,49 @@ BUY_GIFT  = os.getenv("BUY_GIFT", "false").lower() == "true"
 # Фильтры
 P_FROM, P_TO = int(os.getenv("PRICE_LIMIT_FROM", 500)),  int(os.getenv("PRICE_LIMIT_TO", 50_000))
 S_FROM, S_TO = int(os.getenv("SUPPLY_LIMIT_FROM", 1)),   int(os.getenv("SUPPLY_LIMIT_TO", 60_000))
-POLL_MIN, POLL_MAX = int(os.getenv("POLL_INTERVAL_FROM", 25)), int(os.getenv("POLL_INTERVAL_TO", 35))
 
-# Новые флаги (премиум и лимиты)
+# Обычный мониторинг: ~10 секунд по умолчанию
+POLL_MIN = float(os.getenv("POLL_INTERVAL_FROM", "9.5"))
+POLL_MAX = float(os.getenv("POLL_INTERVAL_TO",   "11.5"))
+
+# Бурст-режим
+# 1) Ежечасный «59..05»
+BURST_EACH_HOUR  = (os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on"))
+# 2) Доп. окна через список HH:MM-HH:MM,CSV (опционально)
+BURST_WINDOWS    = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")
+# 3) Частота в бурсте: 1–1.5 с
+BURST_POLL_MIN   = float(os.getenv("BURST_POLL_MIN", "1.0"))
+BURST_POLL_MAX   = float(os.getenv("BURST_POLL_MAX", "1.5"))
+# Прогрев за 45 c
+BURST_PREWARM_SEC= int(os.getenv("BURST_PREWARM_SEC", "45"))
+# Принудительный бурст (минуты) — через .env
+BURST_FORCE_MINUTES = int(os.getenv("BURST_FORCE_MINUTES", "0"))
+# Режим «только бурст» — вне окон не опрашиваем
+BURST_ONLY       = (os.getenv("BURST_ONLY", "false").lower() in ("1","true","yes","on"))
+# Уведомления о входе/выходе из бурста
+BURST_NOTIFY     = (os.getenv("BURST_NOTIFY", "true").lower() in ("1","true","yes","on"))
+
+# Премиум и новые лимиты
 HAS_PREMIUM_DEFAULT = os.getenv("HAS_PREMIUM", "true").lower() in ("1","true","yes","on")
-ONLY_PREMIUM        = os.getenv("ONLY_PREMIUM", "false").lower() in ("1","true","yes","on")  # покупать только require_premium
-CAP_FIRST_RARE      = int(os.getenv("CAP_FIRST_RARE", "10"))   # максимум для 1-го лимитированного
-CAP_SECOND_RARE     = int(os.getenv("CAP_SECOND_RARE", "25"))  # максимум для 2-го лимитированного
+ONLY_PREMIUM        = os.getenv("ONLY_PREMIUM", "false").lower() in ("1","true","yes","on")
+CAP_FIRST_RARE      = int(os.getenv("CAP_FIRST_RARE", "10"))
+CAP_SECOND_RARE     = int(os.getenv("CAP_SECOND_RARE", "25"))
 
-# Уведомления (опционально)
-BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()         # токен бота (только для уведомлений)
+# Уведомления (опционально; не влияют на покупки)
+BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()
 NOTIFY_CHAT_ID  = (os.getenv("NOTIFY_CHAT_ID") or "").strip()
-
 def to_bool(s: Optional[str], default=True) -> bool:
     if s is None: return default
     return s.strip().lower() in ("1","true","yes","on")
-
 NOTIFY_ENABLED     = to_bool(os.getenv("NOTIFY_ENABLED"), True)
 NOTIFY_HOURLY      = to_bool(os.getenv("NOTIFY_HOURLY"),  True)
 NOTIFY_DAILY       = to_bool(os.getenv("NOTIFY_DAILY"),   True)
-NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), True)
+NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), False)  # меньше спама
 NOTIFY_ERRORS      = to_bool(os.getenv("NOTIFY_ERRORS"),  True)
-FAIL_ALERT_MIN_ITV = int(os.getenv("NOTIFY_RECONNECT_MIN_INTERVAL", "900"))  # сек, минимум между «плохими новостями»
+FAIL_ALERT_MIN_ITV = int(os.getenv("NOTIFY_RECONNECT_MIN_INTERVAL", "1800"))
+
+# Отладка частоты опроса
+DEBUG_FETCH_TIMES  = to_bool(os.getenv("DEBUG_FETCH_TIMES"), False)
 
 def fatal(msg): print("[FATAL]", msg); sys.exit(1)
 if not (API_ID and API_HASH): fatal("TG_API_ID / TG_API_HASH пусты")
@@ -83,19 +99,76 @@ if not SESSION and not Path("TgAccount.session").exists(): fatal("нужен TG_
 if BUY_GIFT and not ID_TO_BUY: fatal("ID_TO_BUY обязателен при BUY_GIFT=true")
 
 def compute_watchdog_period() -> int:
-    env = os.getenv("WATCHDOG_PERIOD")
-    if env:
+    v = os.getenv("WATCHDOG_PERIOD")
+    if v:
         try:
-            v = int(env)
-            if v > 0: return v
+            n = int(v)
+            if n > 0: return n
         except Exception:
             pass
-    # Бережный дефолт: ~7 минут или 6× poll_max, что больше
-    return max(420, POLL_MAX * 6, KEEPALIVE_PERIOD * 3)
-
+    # бережный дефолт
+    return max(420, int(POLL_MAX) * 6, KEEPALIVE_PERIOD * 3)
 WATCHDOG_PERIOD = compute_watchdog_period()
 
-# ───────────── уведомлялка (не блокирует покупки) ─────────────
+# ── парсинг пользовательских BURST_WINDOWS ──
+def parse_windows(spec: str) -> List[Tuple[time,time]]:
+    out: List[Tuple[time,time]] = []
+    if not spec: return out
+    for block in spec.split(","):
+        if "-" not in block: continue
+        a,b = block.split("-",1)
+        try:
+            ha,ma = map(int, a.split(":"))
+            hb,mb = map(int, b.split(":"))
+            out.append((time(ha,ma), time(hb,mb)))
+        except Exception:
+            continue
+    return out
+BURST_PARSED = parse_windows(BURST_WINDOWS)
+
+def within_windows(dt: datetime, wins: List[Tuple[time,time]]) -> bool:
+    if not wins: return False
+    t = dt.time()
+    for a,b in wins:
+        if a <= b:
+            if a <= t <= b: return True
+        else:
+            if t >= a or t <= b: return True
+    return False
+
+def in_hourly_burst(dt: datetime) -> bool:
+    if not BURST_EACH_HOUR: return False
+    m = dt.minute
+    return (m >= 59) or (m <= 5)
+
+def seconds_to_next_burst(dt: datetime) -> Optional[int]:
+    """
+    Возвращает сколько секунд до ближайшего входа в бурст
+    (учитывает и ежечасное окно 59..05, и BURST_WINDOWS).
+    """
+    candidates: List[datetime] = []
+
+    # ежечасное 59:00
+    if BURST_EACH_HOUR:
+        base = dt.replace(second=0, microsecond=0)
+        # следующее «59:00» — в этом или следующем часу
+        h59_this = base.replace(minute=59)
+        if h59_this <= dt:
+            h59_this = h59_this + timedelta(hours=1)
+        candidates.append(h59_this)
+
+    # статические окна
+    today = dt.date()
+    for a,_ in BURST_PARSED:
+        candidates.append(datetime.combine(today, a, MSK))
+        candidates.append(datetime.combine(today + timedelta(days=1), a, MSK))
+
+    future = [c for c in candidates if c > dt]
+    if not future: return None
+    delta = min((c - dt for c in future), key=lambda d: d.total_seconds())
+    return max(0, int(delta.total_seconds()))
+
+# ── уведомлялка ──
 class Notifier:
     def __init__(self, bot_token: str, chat_id: str, cli: Client):
         self.bot_token = bot_token or ""
@@ -109,34 +182,25 @@ class Notifier:
         if not NOTIFY_ENABLED: return True
         text = (text or "").strip()
         if not text: return True
-
-        # 1) через Bot API (если есть токен и chat_id)
+        # Bot API
         if self.bot_token and self.chat_id:
             ok = await asyncio.to_thread(self._send_botapi_blocking, text)
             if ok: return True
-
-        # 2) через MTProto пользователя (если chat_id есть)
+        # MTProto (юзер)
         if self.chat_id:
             try:
-                try:
-                    await self.cli.send_message(chat_id=int(self.chat_id), text=text, disable_web_page_preview=True)
+                try:    await self.cli.send_message(int(self.chat_id), text, disable_web_page_preview=True)
                 except ValueError:
-                    await self.cli.send_message(chat_id=self.chat_id, text=text, disable_web_page_preview=True)
+                        await self.cli.send_message(self.chat_id, text, disable_web_page_preview=True)
                 return True
             except Exception as e:
-                if VERBOSE:
-                    print("[WARN] notify MTProto failed:", e)
-
+                if VERBOSE: print("[WARN] notify MTProto failed:", e)
         return False
 
     def _send_botapi_blocking(self, text: str) -> bool:
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            data = urllib.parse.urlencode({
-                "chat_id": self.chat_id,
-                "text": text,
-                "disable_web_page_preview": "true"
-            }).encode()
+            data = urllib.parse.urlencode({"chat_id": self.chat_id, "text": text, "disable_web_page_preview":"true"}).encode()
             req = urllib.request.Request(url, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=self.http_timeout, context=self.ctx) as r:
                 return r.status == 200
@@ -145,13 +209,11 @@ class Notifier:
 
 def fire_and_forget(coro: asyncio.Future) -> None:
     async def _wrap():
-        try:
-            await asyncio.wait_for(coro, timeout=SAFE_NOTIFY_TIMEOUT + 0.5)
-        except Exception:
-            pass
+        try:    await asyncio.wait_for(coro, timeout=SAFE_NOTIFY_TIMEOUT + 0.5)
+        except Exception: pass
     asyncio.create_task(_wrap())
 
-# ───────────── ядро: снайпер ─────────────
+# ── снайпер ──
 class GiftSniper:
     def __init__(self, cli: Client, has_premium: bool):
         self.u = cli
@@ -164,108 +226,66 @@ class GiftSniper:
             except Exception as e:
                 print("[WARN] gifts.json:", e)
         self._last_no_new: Optional[datetime] = None
-
-        # метрики именно успешных fetch-ов
         self.fetch_ok_total: int = 0
         self.fetch_ok_hour:  int = 0
 
-    def reset_hour_metrics(self):
-        self.fetch_ok_hour = 0
-
-    def snapshot_fetch_metrics(self) -> Tuple[int, int]:
-        return self.fetch_ok_total, self.fetch_ok_hour
-
-    @staticmethod
-    def _get(g: Any, name: str, default=None):
-        if isinstance(g, dict): return g.get(name, default)
-        return getattr(g, name, default)
+    def reset_hour_metrics(self): self.fetch_ok_hour = 0
+    def snapshot_fetch_metrics(self) -> Tuple[int, int]: return self.fetch_ok_total, self.fetch_ok_hour
 
     @staticmethod
     def _norm(g: Any) -> Dict[str, Any]:
-        # приводим подарок к единому виду
-        SUP_KEYS = ("supply", "total_count", "total_amount", "amount")
-        sup = None
+        SUP_KEYS = ("supply","total_count","total_amount","amount")
         if isinstance(g, dict):
             sup = next((g.get(k) for k in SUP_KEYS if g.get(k) is not None), None)
             price = g.get("price") or g.get("star_count")
-            emoji = (g.get("sticker") or {}).get("emoji")
-            if emoji == "🎁": emoji = None
-            return dict(
-                id=g.get("id"),
-                title=emoji or f"ID-{g.get('id')}",
-                price=price,
-                supply=sup,
-                is_limited=g.get("is_limited", sup is not None),
-                per_user_remains=g.get("per_user_remains"),
-                limited_per_user=g.get("limited_per_user"),
-                per_user_total=g.get("per_user_total"),
-                require_premium=g.get("require_premium", False),
-            )
-
-        # объект
-        sup = next((getattr(g, k, None) for k in SUP_KEYS if getattr(g, k, None) is not None), None)
-        price = getattr(g, "price", getattr(g, "star_count", None))
-        emoji = getattr(getattr(g, "sticker", None), "emoji", None)
-        if emoji == "🎁": emoji = None
-        return dict(
-            id=getattr(g, "id", None),
-            title=emoji or f"ID-{getattr(g, 'id', None)}",
-            price=price,
-            supply=sup,
-            is_limited=getattr(g, "is_limited", sup is not None),
-            per_user_remains=getattr(g, "per_user_remains", None),
-            limited_per_user=getattr(g, "limited_per_user", None),
-            per_user_total=getattr(g, "per_user_total", None),
-            require_premium=getattr(g, "require_premium", False),
-        )
+            emoji = (g.get("sticker") or {}).get("emoji");  emoji = None if emoji=="🎁" else emoji
+            return dict(id=g.get("id"), title=emoji or f"ID-{g.get('id')}", price=price, supply=sup,
+                        is_limited=g.get("is_limited", sup is not None),
+                        per_user_remains=g.get("per_user_remains"),
+                        limited_per_user=g.get("limited_per_user"),
+                        per_user_total=g.get("per_user_total"),
+                        require_premium=g.get("require_premium", False))
+        sup   = next((getattr(g,k,None) for k in SUP_KEYS if getattr(g,k,None) is not None), None)
+        price = getattr(g,"price", getattr(g,"star_count", None))
+        emoji = getattr(getattr(g,"sticker", None),"emoji", None);  emoji = None if emoji=="🎁" else emoji
+        return dict(id=getattr(g,"id", None), title=emoji or f"ID-{getattr(g,'id',None)}", price=price, supply=sup,
+                    is_limited=getattr(g,"is_limited", sup is not None),
+                    per_user_remains=getattr(g,"per_user_remains", None),
+                    limited_per_user=getattr(g,"limited_per_user", None),
+                    per_user_total=getattr(g,"per_user_total", None),
+                    require_premium=getattr(g,"require_premium", False))
 
     async def _fetch(self) -> List[Dict[str, Any]]:
-        # два шанса на InternalServerError
         try:
             raw = await self.u.get_available_gifts()
         except InternalServerError:
             await asyncio.sleep(1)
             raw = await self.u.get_available_gifts()
-
-        # здесь запрос точно «успешный» → считаем
         self.fetch_ok_total += 1
         self.fetch_ok_hour  += 1
-
+        if DEBUG_FETCH_TIMES:
+            print(f"[{fmt(now())}] fetch_ok")
         gifts = [self._norm(x) for x in (raw or [])]
         gifts.sort(key=lambda x: x["supply"] if x["supply"] is not None else float("inf"))
         return gifts
 
     def _eligible_by_filters(self, g: Dict[str, Any]) -> bool:
-        return (
-            g["price"] is not None and P_FROM <= g["price"] <= P_TO and
-            g["supply"] is not None and S_FROM <= g["supply"] <= S_TO
-        )
+        return (g["price"] is not None and P_FROM <= g["price"] <= P_TO and
+                g["supply"] is not None and S_FROM <= g["supply"] <= S_TO)
 
     def _user_cap(self, g: Dict[str, Any]) -> int:
-        """
-        Сколько нам разрешено купить ЭТИМ аккаунтом по новым полям.
-        Логика:
-          - если gift требует премиум, а у нас его нет → 0
-          - базовый пер-юзер кап: per_user_remains (если есть), иначе limited_per_user (если есть), иначе «много»
-          - на всякий случай не превышаем текущий supply
-        """
         if g.get("require_premium") and not self.has_premium:
             return 0
-
-        # per_user_remains — самое точное: "сколько ещё можно этому пользователю"
         if isinstance(g.get("per_user_remains"), int):
             cap = g["per_user_remains"]
         elif isinstance(g.get("limited_per_user"), int):
             cap = g["limited_per_user"]
         elif isinstance(g.get("per_user_total"), int):
-            # общее допустимое число на пользователя (если нет remains — возьмём как верхнюю границу)
             cap = g["per_user_total"]
         else:
-            cap = 10**9  # «без ограничений» с точки зрения пользователя
-
+            cap = 10**9
         if isinstance(g.get("supply"), int):
             cap = max(0, min(cap, g["supply"]))
-
         return max(0, cap)
 
     async def _buy(self, g: Dict[str, Any], want_qty: int) -> int:
@@ -275,80 +295,49 @@ class GiftSniper:
             try:
                 await self.u.send_gift(ID_TO_BUY, g["id"], False)
                 left -= 1; bought += 1
-                # маленькая пауза, чтобы не уткнуться в FloodWait мгновенно
-                await asyncio.sleep(random.uniform(0.7, 1.5))
+                await asyncio.sleep(random.uniform(0.6, 1.1))
             except FloodWait as fw:
-                print("[FW]", fw.value, "s")
-                await asyncio.sleep(fw.value)
+                print("[FW]", fw.value, "s"); await asyncio.sleep(fw.value)
             except (BadRequest, PeerFlood) as e:
-                print("[ERR] buy:", e)
-                break
+                print("[ERR] buy:", e); break
             except Exception as e:
-                # отдаём выше — пусть main решит reconnect
                 raise e
-
-        if bought:
-            print(f"[BUY] {g['title']} ×{bought}")
+        if bought: print(f"[BUY] {g['title']} ×{bought}")
         return bought
 
     async def tick(self, only_new: bool=False) -> Tuple[bool, bool]:
         gifts = await self._fetch()
+        if only_new:
+            gifts = [g for g in gifts if g["id"] not in self.seen]
         rare_i = 0
         bought_smth = False
         new_found   = False
-
-        if only_new:
-            gifts = [g for g in gifts if g["id"] not in self.seen]
-
         for g in gifts:
-            if g["id"] in self.seen and not only_new:
-                continue
-            self.seen.add(g["id"])
-            new_found = True
-
-            # фильтры по цене/тиражу
-            if not self._eligible_by_filters(g):
-                continue
-
-            # премиум-фильтр (если включён режим “только премиум”)
-            if ONLY_PREMIUM and not g.get("require_premium", False):
-                continue
-
-            # базовый «насколько редкий» лимит
+            if g["id"] in self.seen and not only_new: continue
+            self.seen.add(g["id"]); new_found = True
+            if not self._eligible_by_filters(g): continue
+            if ONLY_PREMIUM and not g.get("require_premium", False): continue
             rarity_cap = 0
             if g["is_limited"]:
-                if rare_i == 0:
-                    rarity_cap = CAP_FIRST_RARE
-                elif rare_i == 1:
-                    rarity_cap = CAP_SECOND_RARE
+                if rare_i == 0:   rarity_cap = CAP_FIRST_RARE
+                elif rare_i == 1: rarity_cap = CAP_SECOND_RARE
                 rare_i += 1
-
             if rarity_cap and BUY_GIFT:
-                # учесть per_user* ограничения
-                user_cap = self._user_cap(g)
-                # итоговый желаемый объём
-                want = max(0, min(rarity_cap, user_cap))
+                want = max(0, min(rarity_cap, self._user_cap(g)))
                 if want > 0:
-                    bought = await self._buy(g, want)
-                    if bought > 0:
-                        bought_smth = True
-
+                    if await self._buy(g, want): bought_smth = True
         if new_found:
-            try:
-                STORAGE.write_text(json.dumps(sorted(self.seen), ensure_ascii=False, indent=2))
-            except Exception as e:
-                print("[WARN] save gifts.json:", e)
-
+            try: STORAGE.write_text(json.dumps(sorted(self.seen), ensure_ascii=False, indent=2))
+            except Exception as e: print("[WARN] save gifts.json:", e)
         if VERBOSE:
             t = fmt(now())
             if bought_smth:
                 print(f"[{t}] ✅ купили"); self._last_no_new = now()
             elif (self._last_no_new is None or (now() - self._last_no_new).seconds >= NO_NEW_EVERY_SEC):
                 print(f"[{t}] — новинок нет"); self._last_no_new = now()
-
         return bought_smth, new_found
 
-# ───────────── коннект ─────────────
+# ── сеть ──
 def build_client() -> Client:
     if SESSION:
         return Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
@@ -399,27 +388,25 @@ async def keepalive(cli: Client, touch_ok):
 def midnight_msk(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-# ───────────── main ─────────────
+# ── main ──
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="однократная проверка новых")
-    ap.add_argument("--check-all", action="store_true", help="однократная проверка всех")
+    ap.add_argument("--check",      action="store_true", help="однократная проверка новых")
+    ap.add_argument("--check-all",  action="store_true", help="однократная проверка всех")
+    ap.add_argument("--burst-only", action="store_true", help="вне бурста не опрашивать вообще")
+    ap.add_argument("--burst-now",  type=int, default=0, help="форсировать бурст на N минут с текущего момента")
     args = ap.parse_args()
 
     cli = build_client()
 
-    # определим is_premium из API (если получится), иначе — из .env
+    # определим is_premium
     has_premium = HAS_PREMIUM_DEFAULT
+    await cli.start()
     try:
-        me = await cli.start();  # start вернёт self; get_me требует started-клиента
-        try:
-            user = await cli.get_me()
-            if hasattr(user, "is_premium") and isinstance(user.is_premium, bool):
-                has_premium = user.is_premium
-        except Exception:
-            pass
-    finally:
-        # если выше не упали, клиент уже стартанут и не надо останавливать
+        user = await cli.get_me()
+        if hasattr(user, "is_premium") and isinstance(user.is_premium, bool):
+            has_premium = user.is_premium
+    except Exception:
         pass
 
     sniper   = GiftSniper(cli, has_premium=has_premium)
@@ -431,61 +418,96 @@ async def main():
     last_fail_alert = now() - timedelta(seconds=FAIL_ALERT_MIN_ITV)
     day_anchor  = midnight_msk(now())
     hour_anchor = now()
-    hour_new    = 0   # сколько «нашли новинок» в текущем часу
+    hour_new    = 0
+
+    # принудительный бурст
+    forced_until: Optional[datetime] = None
+    if args.burst_now > 0:
+        forced_until = now() + timedelta(minutes=args.burst_now)
+    elif BURST_FORCE_MINUTES > 0:
+        forced_until = now() + timedelta(minutes=BURST_FORCE_MINUTES)
+
+    # режим burst-only (флаг из CLI имеет приоритет над .env)
+    burst_only = args.burst_only or BURST_ONLY
+
+    def in_burst(dt: datetime) -> bool:
+        return ((forced_until is not None and dt < forced_until)
+                or in_hourly_burst(dt)
+                or within_windows(dt, BURST_PARSED))
+
+    in_burst_state = in_burst(now())
+    burst_fetch_ok = 0
 
     def touch_ok():
         nonlocal last_ok
         last_ok = now()
 
     try:
-        # если не стартовали (вдруг упали выше) — стартанём
-        if not getattr(cli, "is_connected", False):
-            await cli.start()
-
         fire_and_forget(notifier.send(
             "▶️ GiftSniper запущен ({}) MSK\n"
-            "poll={}–{}s, keepalive={}s, watchdog={}s\n"
-            "has_premium={}, only_premium={}".format(
-                fmt_d(now()), POLL_MIN, POLL_MAX, KEEPALIVE_PERIOD, WATCHDOG_PERIOD,
+            "poll≈{:.1f}–{:.1f}s, burst≈{:.1f}–{:.1f}s (59..05{}), keepalive={}s, watchdog={}s\n"
+            "has_premium={}, only_premium={}, burst_only={}".format(
+                fmt_d(now()),
+                POLL_MIN, POLL_MAX, BURST_POLL_MIN, BURST_POLL_MAX,
+                (", +windows" if BURST_PARSED else ""),
+                KEEPALIVE_PERIOD, WATCHDOG_PERIOD,
                 "yes" if sniper.has_premium else "no",
-                "yes" if ONLY_PREMIUM else "no"
+                "yes" if ONLY_PREMIUM else "no",
+                "yes" if burst_only else "no",
             )
         ))
 
         if args.check or args.check_all:
             bought, new = await sniper.tick(only_new=not args.check_all)
             ok_total, _ = sniper.snapshot_fetch_metrics()
-            txt = (
-                f"ℹ️ Проверка завершена. fetch_ok_total={ok_total}. " +
-                ("✅ были покупки." if bought else ("🆕 были новинки." if new else "новинок нет."))
-            )
-            fire_and_forget(notifier.send(txt))
+            fire_and_forget(notifier.send(
+                f"ℹ️ Проверка: fetch_ok_total={ok_total}; " +
+                ("✅ покупка" if bought else "новинок нет" if not new else "🆕 новинки были")
+            ))
             return
 
         ka_task = asyncio.create_task(keepalive(cli, touch_ok))
 
         while True:
-            # watchdog — давно не было успешных RPC?
+            # прогрев перед ближайшим входом в окно
+            sec_to = seconds_to_next_burst(now())
+            if not in_burst(now()) and sec_to is not None and 0 < sec_to <= BURST_PREWARM_SEC:
+                try:
+                    await cli.get_me()
+                    if Ping is not None:
+                        await cli.invoke(Ping(ping_id=random.randint(1,1<<31)))
+                    touch_ok()
+                except Exception:
+                    pass
+
+            # вход/выход из бурста
+            currently_in = in_burst(now())
+            if currently_in and not in_burst_state:
+                in_burst_state = True
+                burst_fetch_ok = sniper.fetch_ok_total
+                print(f"[{fmt(now())}] ⚡ Входим в бурст-режим")
+                if BURST_NOTIFY: fire_and_forget(notifier.send("⚡ Вошли в бурст-режим опроса."))
+            elif (not currently_in) and in_burst_state:
+                in_burst_state = False
+                made = sniper.fetch_ok_total - burst_fetch_ok
+                print(f"[{fmt(now())}] ✅ Выходим из бурста (успешных fetch: {made})")
+                if BURST_NOTIFY: fire_and_forget(notifier.send(f"✅ Выход из бурста. Успешных fetch: {made}"))
+
+            # watchdog
             if (now() - last_ok).seconds >= WATCHDOG_PERIOD:
                 print("[WARN] watchdog: stale connection → reconnect…")
                 ok = False
                 try:
                     ok = await soft_reconnect(cli)
                 except AuthKeyDuplicated:
-                    fatal("AuthKeyDuplicated — та же MTProto-сессия активна где-то ещё. Закройте лишние сессии или выдайте новый TG_SESSION.")
+                    fatal("AuthKeyDuplicated — та же MTProto-сессия активна где-то ещё.")
                 if not ok:
                     new_cli = await hard_reconnect(cli)
                     if new_cli is not None:
-                        cli = new_cli
-                        sniper.u = cli
-                        notifier.cli = cli
-                        ok = True
+                        cli = new_cli; sniper.u = cli; notifier.cli = cli; ok = True
                 if ok:
-                    reconnects_total += 1
-                    reconnects_hour  += 1
-                    touch_ok()
-                    if NOTIFY_RECONNECT:
-                        fire_and_forget(notifier.send("♻️ Watchdog: переподключились."))
+                    reconnects_total += 1; reconnects_hour += 1; touch_ok()
+                    if NOTIFY_RECONNECT: fire_and_forget(notifier.send("♻️ Watchdog: переподключились."))
                     try: ka_task.cancel()
                     except Exception: pass
                     ka_task = asyncio.create_task(keepalive(cli, touch_ok))
@@ -494,12 +516,12 @@ async def main():
                         fire_and_forget(notifier.send("❗ Watchdog: не удалось переподключиться, попробуем позже."))
                         last_fail_alert = now()
 
-            # основной тик
+            # основной тик: либо всегда, либо только в бурсте
             try:
-                bought, new = await sniper.tick()
-                if new:
-                    hour_new += 1
-                touch_ok()
+                if not burst_only or in_burst_state:
+                    bought, new = await sniper.tick()
+                    if new: hour_new += 1
+                    touch_ok()
             except (OSError, ConnectionError) as e:
                 print("[ERR] connection:", e)
                 ok = False
@@ -510,14 +532,9 @@ async def main():
                 if not ok:
                     new_cli = await hard_reconnect(cli)
                     if new_cli is not None:
-                        cli = new_cli
-                        sniper.u = cli
-                        notifier.cli = cli
-                        ok = True
+                        cli = new_cli; sniper.u = cli; notifier.cli = cli; ok = True
                 if ok:
-                    reconnects_total += 1
-                    reconnects_hour  += 1
-                    touch_ok()
+                    reconnects_total += 1; reconnects_hour += 1; touch_ok()
                     if NOTIFY_RECONNECT:
                         fire_and_forget(notifier.send("♻️ Reconnect после сетевой ошибки."))
                     try: ka_task.cancel()
@@ -533,7 +550,7 @@ async def main():
                     fire_and_forget(notifier.send(f"❗ Ошибка цикла: {e!r}"))
                     last_fail_alert = now()
 
-            # hourly heartbeat — показываем УСПЕШНЫЕ FETCH-и за час
+            # почасовой heartbeat по успешным fetch
             if NOTIFY_HOURLY and (now() - hour_anchor) >= timedelta(hours=1):
                 ok_total, ok_hour = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
@@ -541,12 +558,9 @@ async def main():
                     f"fetch_ok_hour={ok_hour}, new_detected_hour={hour_new}, reconnects_hour={reconnects_hour}\n"
                     f"fetch_ok_total={ok_total}, reconnects_total={reconnects_total}"
                 ))
-                hour_anchor = now()
-                reconnects_hour = 0
-                hour_new = 0
-                sniper.reset_hour_metrics()
+                hour_anchor = now(); reconnects_hour = 0; hour_new = 0; sniper.reset_hour_metrics()
 
-            # daily summary — итог за день по успешным FETCHам
+            # дневная сводка
             if NOTIFY_DAILY and now() >= (midnight_msk(day_anchor) + timedelta(days=1)):
                 ok_total, _ = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
@@ -554,15 +568,19 @@ async def main():
                 ))
                 day_anchor = midnight_msk(now())
 
-            await asyncio.sleep(random.randint(POLL_MIN, POLL_MAX))
+            # сон по режиму
+            if burst_only and not in_burst_state:
+                # вне бурста ничего не делаем — короткий сон
+                await asyncio.sleep(2.0)
+            else:
+                low, high = (BURST_POLL_MIN, BURST_POLL_MAX) if in_burst_state else (POLL_MIN, POLL_MAX)
+                await asyncio.sleep(random.uniform(low, high))
 
     except AuthKeyDuplicated:
         fatal("AuthKeyDuplicated — та же сессия уже активна (закрой другой процесс/устройство или выдай новый TG_SESSION).")
     finally:
-        try:
-            await cli.stop()
-        except Exception:
-            pass
+        try: await cli.stop()
+        except Exception: pass
 
 if __name__ == "__main__":
     try:
