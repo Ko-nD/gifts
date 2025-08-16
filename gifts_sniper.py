@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# GiftSniper — VPS edition (hourly burst 59..05, premium-aware, per-user caps, robust reconnect)
+# GiftSniper — VPS edition (burst 59..05, premium-aware, per-user caps, stars-balance safe-buy, robust reconnect)
+# + instant "new gifts" notifications with stars balance in all logs
+
 from __future__ import annotations
 import argparse, asyncio, json, os, random, sys, ssl, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone, date, time
@@ -23,7 +25,8 @@ RECONNECT_TRIES     = 5
 RECONNECT_PAUSE     = 3         # сек
 SAFE_NOTIFY_TIMEOUT = float(os.getenv("NOTIFY_TIMEOUT", "2.5"))
 
-STORAGE = Path("gifts.json")
+STORAGE       = Path("gifts.json")
+STARS_STATE   = Path("stars_state.json")
 
 # ── время (MSK) ──
 def msk_tz():
@@ -55,27 +58,23 @@ POLL_MIN = float(os.getenv("POLL_INTERVAL_FROM", "9.5"))
 POLL_MAX = float(os.getenv("POLL_INTERVAL_TO",   "11.5"))
 
 # Бурст-режим
-# 1) Ежечасный «59..05»
-BURST_EACH_HOUR  = (os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on"))
-# 2) Доп. окна через список HH:MM-HH:MM,CSV (опционально)
-BURST_WINDOWS    = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")
-# 3) Частота в бурсте: 1–1.5 с
-BURST_POLL_MIN   = float(os.getenv("BURST_POLL_MIN", "1.0"))
-BURST_POLL_MAX   = float(os.getenv("BURST_POLL_MAX", "1.5"))
-# Прогрев за 45 c
-BURST_PREWARM_SEC= int(os.getenv("BURST_PREWARM_SEC", "45"))
-# Принудительный бурст (минуты) — через .env
+BURST_EACH_HOUR   = (os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on"))   # 59..05
+BURST_WINDOWS     = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")                         # "00:00-00:06,12:59-13:05"
+BURST_POLL_MIN    = float(os.getenv("BURST_POLL_MIN", "1.0"))
+BURST_POLL_MAX    = float(os.getenv("BURST_POLL_MAX", "1.5"))
+BURST_PREWARM_SEC = int(os.getenv("BURST_PREWARM_SEC", "45"))
 BURST_FORCE_MINUTES = int(os.getenv("BURST_FORCE_MINUTES", "0"))
-# Режим «только бурст» — вне окон не опрашиваем
-BURST_ONLY       = (os.getenv("BURST_ONLY", "false").lower() in ("1","true","yes","on"))
-# Уведомления о входе/выходе из бурста
-BURST_NOTIFY     = (os.getenv("BURST_NOTIFY", "true").lower() in ("1","true","yes","on"))
+BURST_ONLY        = (os.getenv("BURST_ONLY", "false").lower() in ("1","true","yes","on"))
+BURST_NOTIFY      = (os.getenv("BURST_NOTIFY", "true").lower() in ("1","true","yes","on"))
 
 # Премиум и новые лимиты
 HAS_PREMIUM_DEFAULT = os.getenv("HAS_PREMIUM", "true").lower() in ("1","true","yes","on")
 ONLY_PREMIUM        = os.getenv("ONLY_PREMIUM", "false").lower() in ("1","true","yes","on")
 CAP_FIRST_RARE      = int(os.getenv("CAP_FIRST_RARE", "10"))
 CAP_SECOND_RARE     = int(os.getenv("CAP_SECOND_RARE", "25"))
+
+# Баланс звёзд
+STARS_REFRESH_HOURS = int(os.getenv("STARS_REFRESH_HOURS", "24"))
 
 # Уведомления (опционально; не влияют на покупки)
 BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()
@@ -86,12 +85,14 @@ def to_bool(s: Optional[str], default=True) -> bool:
 NOTIFY_ENABLED     = to_bool(os.getenv("NOTIFY_ENABLED"), True)
 NOTIFY_HOURLY      = to_bool(os.getenv("NOTIFY_HOURLY"),  True)
 NOTIFY_DAILY       = to_bool(os.getenv("NOTIFY_DAILY"),   True)
-NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), False)  # меньше спама
+NOTIFY_RECONNECT   = to_bool(os.getenv("NOTIFY_RECONNECT"), False)
 NOTIFY_ERRORS      = to_bool(os.getenv("NOTIFY_ERRORS"),  True)
 FAIL_ALERT_MIN_ITV = int(os.getenv("NOTIFY_RECONNECT_MIN_INTERVAL", "1800"))
-
-# Отладка частоты опроса
 DEBUG_FETCH_TIMES  = to_bool(os.getenv("DEBUG_FETCH_TIMES"), False)
+
+# Новые уведомления:
+NOTIFY_NEW_GIFTS      = to_bool(os.getenv("NOTIFY_NEW_GIFTS"), True)     # присылать сразу при появлении
+NEW_NOTIFY_MAX_LINES  = int(os.getenv("NEW_NOTIFY_MAX_LINES", "20"))     # макс строк в одном сообщении
 
 def fatal(msg): print("[FATAL]", msg); sys.exit(1)
 if not (API_ID and API_HASH): fatal("TG_API_ID / TG_API_HASH пусты")
@@ -106,11 +107,10 @@ def compute_watchdog_period() -> int:
             if n > 0: return n
         except Exception:
             pass
-    # бережный дефолт
     return max(420, int(POLL_MAX) * 6, KEEPALIVE_PERIOD * 3)
 WATCHDOG_PERIOD = compute_watchdog_period()
 
-# ── парсинг пользовательских BURST_WINDOWS ──
+# ── парсинг BURST_WINDOWS ──
 def parse_windows(spec: str) -> List[Tuple[time,time]]:
     out: List[Tuple[time,time]] = []
     if not spec: return out
@@ -142,27 +142,17 @@ def in_hourly_burst(dt: datetime) -> bool:
     return (m >= 59) or (m <= 5)
 
 def seconds_to_next_burst(dt: datetime) -> Optional[int]:
-    """
-    Возвращает сколько секунд до ближайшего входа в бурст
-    (учитывает и ежечасное окно 59..05, и BURST_WINDOWS).
-    """
     candidates: List[datetime] = []
-
-    # ежечасное 59:00
     if BURST_EACH_HOUR:
         base = dt.replace(second=0, microsecond=0)
-        # следующее «59:00» — в этом или следующем часу
         h59_this = base.replace(minute=59)
         if h59_this <= dt:
             h59_this = h59_this + timedelta(hours=1)
         candidates.append(h59_this)
-
-    # статические окна
     today = dt.date()
     for a,_ in BURST_PARSED:
         candidates.append(datetime.combine(today, a, MSK))
         candidates.append(datetime.combine(today + timedelta(days=1), a, MSK))
-
     future = [c for c in candidates if c > dt]
     if not future: return None
     delta = min((c - dt for c in future), key=lambda d: d.total_seconds())
@@ -213,11 +203,111 @@ def fire_and_forget(coro: asyncio.Future) -> None:
         except Exception: pass
     asyncio.create_task(_wrap())
 
+# ── учёт баланса звёзд ──
+class BalanceManager:
+    def __init__(self, cli: Client):
+        self.cli = cli
+        self.balance: Optional[int] = None
+        self.last_fetch: Optional[datetime] = None
+        self.spent_today: int = 0
+        self.spent_total: int = 0
+        self._day = now().date()
+        self._load()
+
+    def _load(self):
+        if STARS_STATE.exists():
+            try:
+                d = json.loads(STARS_STATE.read_text())
+                self.balance = d.get("balance")
+                ts = d.get("last_fetch")
+                if ts: self.last_fetch = datetime.fromisoformat(ts)
+                self.spent_today = int(d.get("spent_today", 0))
+                self.spent_total = int(d.get("spent_total", 0))
+                day = d.get("day")
+                if day:
+                    try: self._day = date.fromisoformat(day)
+                    except Exception: pass
+            except Exception as e:
+                print("[WARN] stars_state load:", e)
+
+    def _save(self):
+        try:
+            data = {
+                "balance": self.balance,
+                "last_fetch": self.last_fetch.isoformat() if self.last_fetch else None,
+                "spent_today": self.spent_today,
+                "spent_total": self.spent_total,
+                "day": self._day.isoformat()
+            }
+            STARS_STATE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            print("[WARN] stars_state save:", e)
+
+    def ensure_day_rollover(self):
+        if now().date() != self._day:
+            self._day = now().date()
+            self.spent_today = 0
+            self._save()
+
+    async def fetch(self) -> Optional[int]:
+        """Пробуем достать баланс через raw payments.GetStarsStatus()."""
+        try:
+            from pyrogram.raw.functions.payments import GetStarsStatus
+            res = await self.cli.invoke(GetStarsStatus())
+            val = None
+            for k in ("balance", "stars", "amount", "available_balance", "total"):
+                v = getattr(res, k, None)
+                if isinstance(v, int):
+                    val = v
+                    break
+            if val is not None:
+                self.balance = val
+                self.last_fetch = now()
+                self._save()
+                return val
+        except Exception as e:
+            print("[WARN] fetch stars failed:", e)
+        return None
+
+    async def refresh_if_due(self, hours: int) -> Optional[int]:
+        if self.balance is None or self.last_fetch is None:
+            return await self.fetch()
+        if (now() - self.last_fetch).total_seconds() >= hours * 3600:
+            return await self.fetch()
+        return self.balance
+
+    def affordable_qty(self, price: Optional[int], max_want: int) -> int:
+        if price is None or price <= 0:
+            return max_want
+        if self.balance is None:
+            return max_want
+        return max(0, min(max_want, self.balance // price))
+
+    def deduct(self, price: int, qty: int = 1):
+        if self.balance is not None:
+            self.balance = max(0, self.balance - price * qty)
+        self.spent_today += price * qty
+        self.spent_total += price * qty
+        self._save()
+
+    def mark_insufficient(self):
+        self.balance = 0
+        self._save()
+
 # ── снайпер ──
+def _gift_line(g: Dict[str, Any], you_cap: Optional[int]=None) -> str:
+    title = g.get("title") or f"ID-{g.get('id')}"
+    price = g.get("price")
+    supply= g.get("supply")
+    prem  = "P" if g.get("require_premium") else "-"
+    cap_s = f" cap:{you_cap}" if you_cap is not None else ""
+    return f"• {title} | {price}⭐ | left:{supply} | prem:{prem}{cap_s}"
+
 class GiftSniper:
-    def __init__(self, cli: Client, has_premium: bool):
+    def __init__(self, cli: Client, has_premium: bool, bal: BalanceManager):
         self.u = cli
         self.has_premium = has_premium
+        self.bal = bal
         self.seen: set[int] = set()
         if STORAGE.exists():
             try:
@@ -291,51 +381,69 @@ class GiftSniper:
     async def _buy(self, g: Dict[str, Any], want_qty: int) -> int:
         left = want_qty
         bought = 0
+        price = int(g["price"] or 0)
         while left > 0:
+            if self.bal.balance is not None and price > 0 and self.bal.balance < price:
+                break
             try:
                 await self.u.send_gift(ID_TO_BUY, g["id"], False)
                 left -= 1; bought += 1
+                if price > 0:
+                    self.bal.deduct(price, 1)
                 await asyncio.sleep(random.uniform(0.6, 1.1))
             except FloodWait as fw:
                 print("[FW]", fw.value, "s"); await asyncio.sleep(fw.value)
-            except (BadRequest, PeerFlood) as e:
+            except BadRequest as e:
+                emsg = str(e)
+                if "STAR" in emsg.upper() and ("LOW" in emsg.upper() or "FEW" in emsg.upper() or "BALANCE" in emsg.upper()):
+                    print("[ERR] buy: not enough stars -> stop")
+                    self.bal.mark_insufficient()
+                    break
+                print("[ERR] buy:", e); break
+            except PeerFlood as e:
                 print("[ERR] buy:", e); break
             except Exception as e:
                 raise e
         if bought: print(f"[BUY] {g['title']} ×{bought}")
         return bought
 
-    async def tick(self, only_new: bool=False) -> Tuple[bool, bool]:
+    async def tick(self, only_new: bool=False) -> Tuple[bool, bool, List[Dict[str, Any]]]:
         gifts = await self._fetch()
         if only_new:
             gifts = [g for g in gifts if g["id"] not in self.seen]
         rare_i = 0
         bought_smth = False
         new_found   = False
+        new_items   = []
         for g in gifts:
             if g["id"] in self.seen and not only_new: continue
-            self.seen.add(g["id"]); new_found = True
+            self.seen.add(g["id"]); new_found = True; new_items.append(g)
+
             if not self._eligible_by_filters(g): continue
             if ONLY_PREMIUM and not g.get("require_premium", False): continue
+
             rarity_cap = 0
             if g["is_limited"]:
                 if rare_i == 0:   rarity_cap = CAP_FIRST_RARE
                 elif rare_i == 1: rarity_cap = CAP_SECOND_RARE
                 rare_i += 1
             if rarity_cap and BUY_GIFT:
-                want = max(0, min(rarity_cap, self._user_cap(g)))
+                base_cap = max(0, min(rarity_cap, self._user_cap(g)))
+                want = self.bal.affordable_qty(g.get("price"), base_cap)
                 if want > 0:
                     if await self._buy(g, want): bought_smth = True
+
         if new_found:
             try: STORAGE.write_text(json.dumps(sorted(self.seen), ensure_ascii=False, indent=2))
             except Exception as e: print("[WARN] save gifts.json:", e)
+
         if VERBOSE:
             t = fmt(now())
             if bought_smth:
                 print(f"[{t}] ✅ купили"); self._last_no_new = now()
             elif (self._last_no_new is None or (now() - self._last_no_new).seconds >= NO_NEW_EVERY_SEC):
                 print(f"[{t}] — новинок нет"); self._last_no_new = now()
-        return bought_smth, new_found
+        return bought_smth, new_found, new_items
 
 # ── сеть ──
 def build_client() -> Client:
@@ -393,15 +501,16 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check",      action="store_true", help="однократная проверка новых")
     ap.add_argument("--check-all",  action="store_true", help="однократная проверка всех")
+    ap.add_argument("--check-balance", action="store_true", help="показать баланс звёзд и выйти")
     ap.add_argument("--burst-only", action="store_true", help="вне бурста не опрашивать вообще")
     ap.add_argument("--burst-now",  type=int, default=0, help="форсировать бурст на N минут с текущего момента")
     args = ap.parse_args()
 
     cli = build_client()
+    await cli.start()
 
     # определим is_premium
     has_premium = HAS_PREMIUM_DEFAULT
-    await cli.start()
     try:
         user = await cli.get_me()
         if hasattr(user, "is_premium") and isinstance(user.is_premium, bool):
@@ -409,8 +518,15 @@ async def main():
     except Exception:
         pass
 
-    sniper   = GiftSniper(cli, has_premium=has_premium)
+    bal      = BalanceManager(cli)
+    sniper   = GiftSniper(cli, has_premium=has_premium, bal=bal)
     notifier = Notifier(BOT_TOKEN, NOTIFY_CHAT_ID, cli)
+
+    # баланс при старте / по запросу
+    await bal.refresh_if_due(STARS_REFRESH_HOURS)
+    if args.check_balance:
+        print("Stars balance:", bal.balance if bal.balance is not None else "unknown")
+        return
 
     reconnects_total = 0
     reconnects_hour  = 0
@@ -427,7 +543,7 @@ async def main():
     elif BURST_FORCE_MINUTES > 0:
         forced_until = now() + timedelta(minutes=BURST_FORCE_MINUTES)
 
-    # режим burst-only (флаг из CLI имеет приоритет над .env)
+    # режим burst-only
     burst_only = args.burst_only or BURST_ONLY
 
     def in_burst(dt: datetime) -> bool:
@@ -442,34 +558,54 @@ async def main():
         nonlocal last_ok
         last_ok = now()
 
+    def with_star_tail(msg: str) -> str:
+        bal_str = (str(bal.balance) if bal.balance is not None else "unknown")
+        return f"{msg}\n⭐ stars={bal_str}, spent_today={bal.spent_today}"
+
     try:
         fire_and_forget(notifier.send(
-            "▶️ GiftSniper запущен ({}) MSK\n"
-            "poll≈{:.1f}–{:.1f}s, burst≈{:.1f}–{:.1f}s (59..05{}), keepalive={}s, watchdog={}s\n"
-            "has_premium={}, only_premium={}, burst_only={}".format(
-                fmt_d(now()),
-                POLL_MIN, POLL_MAX, BURST_POLL_MIN, BURST_POLL_MAX,
-                (", +windows" if BURST_PARSED else ""),
-                KEEPALIVE_PERIOD, WATCHDOG_PERIOD,
-                "yes" if sniper.has_premium else "no",
-                "yes" if ONLY_PREMIUM else "no",
-                "yes" if burst_only else "no",
+            with_star_tail(
+                "▶️ GiftSniper запущен ({}) MSK\n"
+                "poll≈{:.1f}–{:.1f}s, burst≈{:.1f}–{:.1f}s (59..05{}), keepalive={}s, watchdog={}s\n"
+                "has_premium={}, only_premium={}, burst_only={}".format(
+                    fmt_d(now()),
+                    POLL_MIN, POLL_MAX, BURST_POLL_MIN, BURST_POLL_MAX,
+                    (", +windows" if BURST_PARSED else ""),
+                    KEEPALIVE_PERIOD, WATCHDOG_PERIOD,
+                    "yes" if sniper.has_premium else "no",
+                    "yes" if ONLY_PREMIUM else "no",
+                    "yes" if burst_only else "no",
+                )
             )
         ))
 
         if args.check or args.check_all:
-            bought, new = await sniper.tick(only_new=not args.check_all)
+            bought, new, new_items = await sniper.tick(only_new=not args.check_all)
             ok_total, _ = sniper.snapshot_fetch_metrics()
+            base = f"ℹ️ Проверка: fetch_ok_total={ok_total}"
+            base = with_star_tail(base)
             fire_and_forget(notifier.send(
-                f"ℹ️ Проверка: fetch_ok_total={ok_total}; " +
-                ("✅ покупка" if bought else "новинок нет" if not new else "🆕 новинки были")
+                base + ("\n✅ была покупка." if bought else ("\n🆕 найдены новинки." if new else "\nновинок нет."))
             ))
+            # если есть новые — пришлём их список
+            if new and NOTIFY_NEW_GIFTS:
+                lines = []
+                for g in new_items[:NEW_NOTIFY_MAX_LINES]:
+                    lines.append(_gift_line(g, you_cap=sniper._user_cap(g)))
+                more = len(new_items) - len(lines)
+                tail = f"\n… и ещё {more}" if more > 0 else ""
+                fire_and_forget(notifier.send(with_star_tail("🆕 Новые подарки:\n" + "\n".join(lines) + tail)))
             return
 
         ka_task = asyncio.create_task(keepalive(cli, touch_ok))
 
         while True:
-            # прогрев перед ближайшим входом в окно
+            # rollover по дате
+            bal.ensure_day_rollover()
+            # периодическое обновление баланса
+            await bal.refresh_if_due(STARS_REFRESH_HOURS)
+
+            # прогрев
             sec_to = seconds_to_next_burst(now())
             if not in_burst(now()) and sec_to is not None and 0 < sec_to <= BURST_PREWARM_SEC:
                 try:
@@ -480,18 +616,18 @@ async def main():
                 except Exception:
                     pass
 
-            # вход/выход из бурста
+            # вход/выход бурста
             currently_in = in_burst(now())
             if currently_in and not in_burst_state:
                 in_burst_state = True
                 burst_fetch_ok = sniper.fetch_ok_total
                 print(f"[{fmt(now())}] ⚡ Входим в бурст-режим")
-                if BURST_NOTIFY: fire_and_forget(notifier.send("⚡ Вошли в бурст-режим опроса."))
+                if BURST_NOTIFY: fire_and_forget(notifier.send(with_star_tail("⚡ Вошли в бурст-режим опроса.")))
             elif (not currently_in) and in_burst_state:
                 in_burst_state = False
                 made = sniper.fetch_ok_total - burst_fetch_ok
                 print(f"[{fmt(now())}] ✅ Выходим из бурста (успешных fetch: {made})")
-                if BURST_NOTIFY: fire_and_forget(notifier.send(f"✅ Выход из бурста. Успешных fetch: {made}"))
+                if BURST_NOTIFY: fire_and_forget(notifier.send(with_star_tail(f"✅ Выход из бурста. Успешных fetch: {made}")))
 
             # watchdog
             if (now() - last_ok).seconds >= WATCHDOG_PERIOD:
@@ -507,20 +643,28 @@ async def main():
                         cli = new_cli; sniper.u = cli; notifier.cli = cli; ok = True
                 if ok:
                     reconnects_total += 1; reconnects_hour += 1; touch_ok()
-                    if NOTIFY_RECONNECT: fire_and_forget(notifier.send("♻️ Watchdog: переподключились."))
+                    if NOTIFY_RECONNECT: fire_and_forget(notifier.send(with_star_tail("♻️ Watchdog: переподключились.")))
                     try: ka_task.cancel()
                     except Exception: pass
                     ka_task = asyncio.create_task(keepalive(cli, touch_ok))
                 else:
                     if (now() - last_fail_alert).seconds >= FAIL_ALERT_MIN_ITV and NOTIFY_ERRORS:
-                        fire_and_forget(notifier.send("❗ Watchdog: не удалось переподключиться, попробуем позже."))
+                        fire_and_forget(notifier.send(with_star_tail("❗ Watchdog: не удалось переподключиться, попробуем позже.")))
                         last_fail_alert = now()
 
-            # основной тик: либо всегда, либо только в бурсте
+            # основной тик
             try:
                 if not burst_only or in_burst_state:
-                    bought, new = await sniper.tick()
-                    if new: hour_new += 1
+                    bought, new, new_items = await sniper.tick()
+                    if new:
+                        hour_new += 1
+                        if NOTIFY_NEW_GIFTS:
+                            lines = []
+                            for g in new_items[:NEW_NOTIFY_MAX_LINES]:
+                                lines.append(_gift_line(g, you_cap=sniper._user_cap(g)))
+                            more = len(new_items) - len(lines)
+                            tail = f"\n… и ещё {more}" if more > 0 else ""
+                            fire_and_forget(notifier.send(with_star_tail("🆕 Новые подарки:\n" + "\n".join(lines) + tail)))
                     touch_ok()
             except (OSError, ConnectionError) as e:
                 print("[ERR] connection:", e)
@@ -536,41 +680,44 @@ async def main():
                 if ok:
                     reconnects_total += 1; reconnects_hour += 1; touch_ok()
                     if NOTIFY_RECONNECT:
-                        fire_and_forget(notifier.send("♻️ Reconnect после сетевой ошибки."))
+                        fire_and_forget(notifier.send(with_star_tail("♻️ Reconnect после сетевой ошибки.")))
                     try: ka_task.cancel()
                     except Exception: pass
                     ka_task = asyncio.create_task(keepalive(cli, touch_ok))
                 else:
                     if (now() - last_fail_alert).seconds >= FAIL_ALERT_MIN_ITV and NOTIFY_ERRORS:
-                        fire_and_forget(notifier.send("❗ Reconnect после сетевой ошибки не удался."))
+                        fire_and_forget(notifier.send(with_star_tail("❗ Reconnect после сетевой ошибки не удался.")))
                         last_fail_alert = now()
             except Exception as e:
                 print("[ERR] main:", e)
                 if (now() - last_fail_alert).seconds >= FAIL_ALERT_MIN_ITV and NOTIFY_ERRORS:
-                    fire_and_forget(notifier.send(f"❗ Ошибка цикла: {e!r}"))
+                    fire_and_forget(notifier.send(with_star_tail(f"❗ Ошибка цикла: {e!r}")))
                     last_fail_alert = now()
 
-            # почасовой heartbeat по успешным fetch
+            # heartbeat — с балансом
             if NOTIFY_HOURLY and (now() - hour_anchor) >= timedelta(hours=1):
                 ok_total, ok_hour = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
-                    f"🕐 Heartbeat {fmt_d(now())} MSK\n"
-                    f"fetch_ok_hour={ok_hour}, new_detected_hour={hour_new}, reconnects_hour={reconnects_hour}\n"
-                    f"fetch_ok_total={ok_total}, reconnects_total={reconnects_total}"
+                    with_star_tail(
+                        f"🕐 Heartbeat {fmt_d(now())} MSK\n"
+                        f"fetch_ok_hour={ok_hour}, new_detected_hour={hour_new}, reconnects_hour={reconnects_hour}\n"
+                        f"fetch_ok_total={ok_total}, reconnects_total={reconnects_total}"
+                    )
                 ))
                 hour_anchor = now(); reconnects_hour = 0; hour_new = 0; sniper.reset_hour_metrics()
 
-            # дневная сводка
+            # daily summary — с балансом
             if NOTIFY_DAILY and now() >= (midnight_msk(day_anchor) + timedelta(days=1)):
                 ok_total, _ = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
-                    f"📊 Daily summary ({day_anchor.date()}): fetch_ok_total={ok_total}, reconnects_total={reconnects_total}"
+                    with_star_tail(
+                        f"📊 Daily summary ({day_anchor.date()}): fetch_ok_total={ok_total}, reconnects_total={reconnects_total}"
+                    )
                 ))
                 day_anchor = midnight_msk(now())
 
             # сон по режиму
             if burst_only and not in_burst_state:
-                # вне бурста ничего не делаем — короткий сон
                 await asyncio.sleep(2.0)
             else:
                 low, high = (BURST_POLL_MIN, BURST_POLL_MAX) if in_burst_state else (POLL_MIN, POLL_MAX)
