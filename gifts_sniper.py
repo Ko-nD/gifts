@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-# GiftSniper — VPS edition (burst 59..05, premium-aware, per-user caps, stars-balance safe-buy, robust reconnect)
-# + instant "new gifts" notifications with stars balance in all logs
+# GiftSniper — VPS edition (burst 59..05, premium-aware, per-user caps,
+# stars fallback balance + smart skip on insufficient funds, robust reconnect)
+# - сначала пытаемся дарить в канал (если указан), затем в личный ID_TO_BUY
+# - мгновенные уведомления о новых подарках + во всех логах показываем звёзды
 
 from __future__ import annotations
 import argparse, asyncio, json, os, random, sys, ssl, urllib.parse, urllib.request
@@ -19,10 +21,10 @@ except Exception:
 
 # ── базовые настройки ──
 VERBOSE             = True
-NO_NEW_EVERY_SEC    = 60        # «новинок нет» — не чаще
-KEEPALIVE_PERIOD    = 90        # сек
+NO_NEW_EVERY_SEC    = 60
+KEEPALIVE_PERIOD    = 90
 RECONNECT_TRIES     = 5
-RECONNECT_PAUSE     = 3         # сек
+RECONNECT_PAUSE     = 3
 SAFE_NOTIFY_TIMEOUT = float(os.getenv("NOTIFY_TIMEOUT", "2.5"))
 
 STORAGE       = Path("gifts.json")
@@ -46,39 +48,48 @@ API_ID   = int(os.getenv("TG_API_ID", 0))
 API_HASH = os.getenv("TG_API_HASH", "")
 SESSION  = os.getenv("TG_SESSION") or None
 
-ID_TO_BUY = int(os.getenv("ID_TO_BUY", 0))
-BUY_GIFT  = os.getenv("BUY_GIFT", "false").lower() == "true"
+# основная цель (человек)
+ID_TO_BUY = int(os.getenv("ID_TO_BUY", "0") or "0")
+BUY_GIFT  = os.getenv("BUY_GIFT", "false").lower() in ("1","true","yes","on")
+
+# канал, куда пробуем дарить первым делом
+BUY_CHANNEL_ID = (os.getenv("BUY_CHANNEL_ID") or "").strip()
+# если не задан отдельный канал — используем канал для логов как приоритетную цель
+NOTIFY_CHAT_ID = (os.getenv("NOTIFY_CHAT_ID") or "").strip()
+if not BUY_CHANNEL_ID:
+    BUY_CHANNEL_ID = NOTIFY_CHAT_ID
+BUY_CHANNEL_FIRST = os.getenv("BUY_CHANNEL_FIRST", "true").lower() in ("1","true","yes","on")
 
 # Фильтры
 P_FROM, P_TO = int(os.getenv("PRICE_LIMIT_FROM", 500)),  int(os.getenv("PRICE_LIMIT_TO", 50_000))
 S_FROM, S_TO = int(os.getenv("SUPPLY_LIMIT_FROM", 1)),   int(os.getenv("SUPPLY_LIMIT_TO", 60_000))
 
-# Обычный мониторинг: ~10 секунд по умолчанию
+# обычный мониторинг
 POLL_MIN = float(os.getenv("POLL_INTERVAL_FROM", "9.5"))
 POLL_MAX = float(os.getenv("POLL_INTERVAL_TO",   "11.5"))
 
-# Бурст-режим
-BURST_EACH_HOUR   = (os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on"))   # 59..05
-BURST_WINDOWS     = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")                         # "00:00-00:06,12:59-13:05"
+# бурст-режим
+BURST_EACH_HOUR   = os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on")
+BURST_WINDOWS     = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")
 BURST_POLL_MIN    = float(os.getenv("BURST_POLL_MIN", "1.0"))
 BURST_POLL_MAX    = float(os.getenv("BURST_POLL_MAX", "1.5"))
 BURST_PREWARM_SEC = int(os.getenv("BURST_PREWARM_SEC", "45"))
 BURST_FORCE_MINUTES = int(os.getenv("BURST_FORCE_MINUTES", "0"))
-BURST_ONLY        = (os.getenv("BURST_ONLY", "false").lower() in ("1","true","yes","on"))
-BURST_NOTIFY      = (os.getenv("BURST_NOTIFY", "true").lower() in ("1","true","yes","on"))
+BURST_ONLY        = os.getenv("BURST_ONLY", "false").lower() in ("1","true","yes","on")
+BURST_NOTIFY      = os.getenv("BURST_NOTIFY", "true").lower() in ("1","true","yes","on")
 
-# Премиум и новые лимиты
+# премиум и лимиты
 HAS_PREMIUM_DEFAULT = os.getenv("HAS_PREMIUM", "true").lower() in ("1","true","yes","on")
 ONLY_PREMIUM        = os.getenv("ONLY_PREMIUM", "false").lower() in ("1","true","yes","on")
 CAP_FIRST_RARE      = int(os.getenv("CAP_FIRST_RARE", "10"))
 CAP_SECOND_RARE     = int(os.getenv("CAP_SECOND_RARE", "25"))
 
-# Баланс звёзд
-STARS_REFRESH_HOURS = int(os.getenv("STARS_REFRESH_HOURS", "24"))
+# баланс звёзд
+STARS_REFRESH_HOURS   = int(os.getenv("STARS_REFRESH_HOURS", "24"))
+STARS_FALLBACK_BAL    = int(os.getenv("STARS_FALLBACK_BALANCE", "10000"))  # ← по умолчанию 10к
 
-# Уведомления (опционально; не влияют на покупки)
+# уведомления (опционально)
 BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()
-NOTIFY_CHAT_ID  = (os.getenv("NOTIFY_CHAT_ID") or "").strip()
 def to_bool(s: Optional[str], default=True) -> bool:
     if s is None: return default
     return s.strip().lower() in ("1","true","yes","on")
@@ -90,14 +101,14 @@ NOTIFY_ERRORS      = to_bool(os.getenv("NOTIFY_ERRORS"),  True)
 FAIL_ALERT_MIN_ITV = int(os.getenv("NOTIFY_RECONNECT_MIN_INTERVAL", "1800"))
 DEBUG_FETCH_TIMES  = to_bool(os.getenv("DEBUG_FETCH_TIMES"), False)
 
-# Новые уведомления:
-NOTIFY_NEW_GIFTS      = to_bool(os.getenv("NOTIFY_NEW_GIFTS"), True)     # присылать сразу при появлении
-NEW_NOTIFY_MAX_LINES  = int(os.getenv("NEW_NOTIFY_MAX_LINES", "20"))     # макс строк в одном сообщении
+# мгновенные уведомления о новых подарках
+NOTIFY_NEW_GIFTS      = to_bool(os.getenv("NOTIFY_NEW_GIFTS"), True)
+NEW_NOTIFY_MAX_LINES  = int(os.getenv("NEW_NOTIFY_MAX_LINES", "20"))
 
 def fatal(msg): print("[FATAL]", msg); sys.exit(1)
 if not (API_ID and API_HASH): fatal("TG_API_ID / TG_API_HASH пусты")
-if not SESSION and not Path("TgAccount.session").exists(): fatal("нужен TG_SESSION или файл TgAccount.session")
-if BUY_GIFT and not ID_TO_BUY: fatal("ID_TO_BUY обязателен при BUY_GIFT=true")
+if BUY_GIFT and not (BUY_CHANNEL_ID or ID_TO_BUY):
+    fatal("Нужен BUY_CHANNEL_ID или ID_TO_BUY при BUY_GIFT=true")
 
 def compute_watchdog_period() -> int:
     v = os.getenv("WATCHDOG_PERIOD")
@@ -110,7 +121,7 @@ def compute_watchdog_period() -> int:
     return max(420, int(POLL_MAX) * 6, KEEPALIVE_PERIOD * 3)
 WATCHDOG_PERIOD = compute_watchdog_period()
 
-# ── парсинг BURST_WINDOWS ──
+# ── окна бурста ──
 def parse_windows(spec: str) -> List[Tuple[time,time]]:
     out: List[Tuple[time,time]] = []
     if not spec: return out
@@ -137,17 +148,14 @@ def within_windows(dt: datetime, wins: List[Tuple[time,time]]) -> bool:
     return False
 
 def in_hourly_burst(dt: datetime) -> bool:
-    if not BURST_EACH_HOUR: return False
-    m = dt.minute
-    return (m >= 59) or (m <= 5)
+    return BURST_EACH_HOUR and (dt.minute >= 59 or dt.minute <= 5)
 
 def seconds_to_next_burst(dt: datetime) -> Optional[int]:
     candidates: List[datetime] = []
     if BURST_EACH_HOUR:
         base = dt.replace(second=0, microsecond=0)
         h59_this = base.replace(minute=59)
-        if h59_this <= dt:
-            h59_this = h59_this + timedelta(hours=1)
+        if h59_this <= dt: h59_this = h59_this + timedelta(hours=1)
         candidates.append(h59_this)
     today = dt.date()
     for a,_ in BURST_PARSED:
@@ -213,12 +221,17 @@ class BalanceManager:
         self.spent_total: int = 0
         self._day = now().date()
         self._load()
+        # если ничего не загрузилось — применим fallback
+        if self.balance is None:
+            self.balance = max(0, int(STARS_FALLBACK_BAL))
+            self._save()
 
     def _load(self):
         if STARS_STATE.exists():
             try:
                 d = json.loads(STARS_STATE.read_text())
-                self.balance = d.get("balance")
+                bal = d.get("balance")
+                if isinstance(bal, int): self.balance = bal
                 ts = d.get("last_fetch")
                 if ts: self.last_fetch = datetime.fromisoformat(ts)
                 self.spent_today = int(d.get("spent_today", 0))
@@ -250,7 +263,7 @@ class BalanceManager:
             self._save()
 
     async def fetch(self) -> Optional[int]:
-        """Пробуем достать баланс через raw payments.GetStarsStatus()."""
+        """Пробуем достать баланс через raw payments.GetStarsStatus(). Может не работать — тогда оставим локальный."""
         try:
             from pyrogram.raw.functions.payments import GetStarsStatus
             res = await self.cli.invoke(GetStarsStatus())
@@ -266,7 +279,8 @@ class BalanceManager:
                 self._save()
                 return val
         except Exception as e:
-            print("[WARN] fetch stars failed:", e)
+            # тихо: не хотим ломать покупки
+            pass
         return None
 
     async def refresh_if_due(self, hours: int) -> Optional[int]:
@@ -290,11 +304,19 @@ class BalanceManager:
         self.spent_total += price * qty
         self._save()
 
-    def mark_insufficient(self):
-        self.balance = 0
+    def note_insufficient_for(self, price: int):
+        """Если не хватило звёзд на price — опускаем локальный баланс до price-1,
+        чтобы не тратить время на попытки купить столь же дорогие подарки."""
+        if price and price > 0:
+            if self.balance is None or self.balance >= price:
+                self.balance = max(0, price - 1)
+                self._save()
+
+    def set_balance(self, new_balance: int):
+        self.balance = max(0, int(new_balance))
         self._save()
 
-# ── снайпер ──
+# ── утилиты ──
 def _gift_line(g: Dict[str, Any], you_cap: Optional[int]=None) -> str:
     title = g.get("title") or f"ID-{g.get('id')}"
     price = g.get("price")
@@ -303,11 +325,22 @@ def _gift_line(g: Dict[str, Any], you_cap: Optional[int]=None) -> str:
     cap_s = f" cap:{you_cap}" if you_cap is not None else ""
     return f"• {title} | {price}⭐ | left:{supply} | prem:{prem}{cap_s}"
 
+def _is_insufficient_stars_error(e: Exception) -> bool:
+    s = str(e).upper()
+    # разных формулировок много — ловим по ключевым словам
+    return ("STAR" in s) and ("LOW" in s or "FEW" in s or "BALANCE" in s or "NOT ENOUGH" in s)
+
+def _is_usage_limited_error(e: Exception) -> bool:
+    # пример: STARGIFT_USAGE_LIMITED
+    return "USAGE_LIMIT" in str(e).upper()
+
+# ── снайпер ──
 class GiftSniper:
-    def __init__(self, cli: Client, has_premium: bool, bal: BalanceManager):
+    def __init__(self, cli: Client, has_premium: bool, bal: BalanceManager, recipients: List[str|int]):
         self.u = cli
         self.has_premium = has_premium
         self.bal = bal
+        self.recipients = recipients[:]  # порядок важен
         self.seen: set[int] = set()
         if STORAGE.exists():
             try:
@@ -378,33 +411,66 @@ class GiftSniper:
             cap = max(0, min(cap, g["supply"]))
         return max(0, cap)
 
+    async def _send_one(self, peer: str|int, gift_id: int):
+        return await self.u.send_gift(peer, gift_id, False)
+
     async def _buy(self, g: Dict[str, Any], want_qty: int) -> int:
         left = want_qty
         bought = 0
         price = int(g["price"] or 0)
         while left > 0:
+            # на дорогих — не тратить время, если уже не тянем
             if self.bal.balance is not None and price > 0 and self.bal.balance < price:
                 break
-            try:
-                await self.u.send_gift(ID_TO_BUY, g["id"], False)
-                left -= 1; bought += 1
-                if price > 0:
-                    self.bal.deduct(price, 1)
-                await asyncio.sleep(random.uniform(0.6, 1.1))
-            except FloodWait as fw:
-                print("[FW]", fw.value, "s"); await asyncio.sleep(fw.value)
-            except BadRequest as e:
-                emsg = str(e)
-                if "STAR" in emsg.upper() and ("LOW" in emsg.upper() or "FEW" in emsg.upper() or "BALANCE" in emsg.upper()):
-                    print("[ERR] buy: not enough stars -> stop")
-                    self.bal.mark_insufficient()
+
+            sent_this_try = False
+            last_err: Optional[Exception] = None
+
+            for peer in self.recipients:
+                try:
+                    await self._send_one(peer, g["id"])
+                    sent_this_try = True
                     break
-                print("[ERR] buy:", e); break
-            except PeerFlood as e:
-                print("[ERR] buy:", e); break
-            except Exception as e:
-                raise e
-        if bought: print(f"[BUY] {g['title']} ×{bought}")
+                except FloodWait as fw:
+                    print("[FW]", fw.value, "s"); await asyncio.sleep(fw.value)
+                    # после ожидания попробуем этот же peer ещё раз в следующей итерации покупки
+                    last_err = fw
+                    break
+                except BadRequest as e:
+                    # если не хватает звёзд — пометим и прекращаем покупки этого подарка
+                    if _is_insufficient_stars_error(e):
+                        print("[ERR] buy: not enough stars -> skip this gift")
+                        self.bal.note_insufficient_for(price)
+                        return bought
+                    # если «usage limited» — тоже сразу выходим
+                    if _is_usage_limited_error(e):
+                        print("[ERR] buy: usage limited -> skip this gift")
+                        return bought
+                    # иначе — пробуем следующий peer (например, «в канал нельзя»)
+                    last_err = e
+                    continue
+                except PeerFlood as e:
+                    # бессмысленно долбиться дальше
+                    print("[ERR] buy:", e); return bought
+                except Exception as e:
+                    # неизвестная ошибка — попробуем следующий peer
+                    last_err = e
+                    continue
+
+            if not sent_this_try:
+                # не удалось ни в один peer — прекращаем этот подарок
+                if last_err and VERBOSE:
+                    print("[ERR] buy:", last_err)
+                return bought
+
+            # успех
+            left -= 1; bought += 1
+            if price > 0:
+                self.bal.deduct(price, 1)
+            await asyncio.sleep(random.uniform(0.6, 1.1))
+
+        if bought:
+            print(f"[BUY] {g['title']} ×{bought}")
         return bought
 
     async def tick(self, only_new: bool=False) -> Tuple[bool, bool, List[Dict[str, Any]]]:
@@ -427,6 +493,7 @@ class GiftSniper:
                 if rare_i == 0:   rarity_cap = CAP_FIRST_RARE
                 elif rare_i == 1: rarity_cap = CAP_SECOND_RARE
                 rare_i += 1
+
             if rarity_cap and BUY_GIFT:
                 base_cap = max(0, min(rarity_cap, self._user_cap(g)))
                 want = self.bal.affordable_qty(g.get("price"), base_cap)
@@ -502,6 +569,7 @@ async def main():
     ap.add_argument("--check",      action="store_true", help="однократная проверка новых")
     ap.add_argument("--check-all",  action="store_true", help="однократная проверка всех")
     ap.add_argument("--check-balance", action="store_true", help="показать баланс звёзд и выйти")
+    ap.add_argument("--set-balance", type=int, default=None, help="установить локальный баланс звёзд и выйти")
     ap.add_argument("--burst-only", action="store_true", help="вне бурста не опрашивать вообще")
     ap.add_argument("--burst-now",  type=int, default=0, help="форсировать бурст на N минут с текущего момента")
     args = ap.parse_args()
@@ -509,7 +577,7 @@ async def main():
     cli = build_client()
     await cli.start()
 
-    # определим is_premium
+    # is_premium
     has_premium = HAS_PREMIUM_DEFAULT
     try:
         user = await cli.get_me()
@@ -519,14 +587,29 @@ async def main():
         pass
 
     bal      = BalanceManager(cli)
-    sniper   = GiftSniper(cli, has_premium=has_premium, bal=bal)
-    notifier = Notifier(BOT_TOKEN, NOTIFY_CHAT_ID, cli)
-
-    # баланс при старте / по запросу
+    if args.set_balance is not None:
+        bal.set_balance(args.set_balance)
+        print("Stars balance set to:", bal.balance)
+        return
     await bal.refresh_if_due(STARS_REFRESH_HOURS)
     if args.check_balance:
         print("Stars balance:", bal.balance if bal.balance is not None else "unknown")
         return
+
+    # список получателей в порядке приоритета
+    recipients: List[str|int] = []
+    if BUY_CHANNEL_FIRST and BUY_CHANNEL_ID:
+        recipients.append(BUY_CHANNEL_ID)
+    if ID_TO_BUY:
+        recipients.append(ID_TO_BUY)
+    # если канал не первый — переставим
+    if not BUY_CHANNEL_FIRST and BUY_CHANNEL_ID:
+        if BUY_CHANNEL_ID in recipients:
+            recipients.remove(BUY_CHANNEL_ID)
+        recipients.append(BUY_CHANNEL_ID)
+
+    notifier = Notifier(BOT_TOKEN, NOTIFY_CHAT_ID, cli)
+    sniper   = GiftSniper(cli, has_premium=has_premium, bal=bal, recipients=recipients)
 
     reconnects_total = 0
     reconnects_hour  = 0
@@ -543,7 +626,6 @@ async def main():
     elif BURST_FORCE_MINUTES > 0:
         forced_until = now() + timedelta(minutes=BURST_FORCE_MINUTES)
 
-    # режим burst-only
     burst_only = args.burst_only or BURST_ONLY
 
     def in_burst(dt: datetime) -> bool:
@@ -567,7 +649,7 @@ async def main():
             with_star_tail(
                 "▶️ GiftSniper запущен ({}) MSK\n"
                 "poll≈{:.1f}–{:.1f}s, burst≈{:.1f}–{:.1f}s (59..05{}), keepalive={}s, watchdog={}s\n"
-                "has_premium={}, only_premium={}, burst_only={}".format(
+                "has_premium={}, only_premium={}, burst_only={}, buy_first={}".format(
                     fmt_d(now()),
                     POLL_MIN, POLL_MAX, BURST_POLL_MIN, BURST_POLL_MAX,
                     (", +windows" if BURST_PARSED else ""),
@@ -575,6 +657,7 @@ async def main():
                     "yes" if sniper.has_premium else "no",
                     "yes" if ONLY_PREMIUM else "no",
                     "yes" if burst_only else "no",
+                    "channel" if (BUY_CHANNEL_FIRST and BUY_CHANNEL_ID) else "user"
                 )
             )
         ))
@@ -587,7 +670,6 @@ async def main():
             fire_and_forget(notifier.send(
                 base + ("\n✅ была покупка." if bought else ("\n🆕 найдены новинки." if new else "\nновинок нет."))
             ))
-            # если есть новые — пришлём их список
             if new and NOTIFY_NEW_GIFTS:
                 lines = []
                 for g in new_items[:NEW_NOTIFY_MAX_LINES]:
@@ -600,12 +682,10 @@ async def main():
         ka_task = asyncio.create_task(keepalive(cli, touch_ok))
 
         while True:
-            # rollover по дате
             bal.ensure_day_rollover()
-            # периодическое обновление баланса
             await bal.refresh_if_due(STARS_REFRESH_HOURS)
 
-            # прогрев
+            # прогрев перед ближайшим окном
             sec_to = seconds_to_next_burst(now())
             if not in_burst(now()) and sec_to is not None and 0 < sec_to <= BURST_PREWARM_SEC:
                 try:
@@ -656,15 +736,14 @@ async def main():
             try:
                 if not burst_only or in_burst_state:
                     bought, new, new_items = await sniper.tick()
-                    if new:
-                        hour_new += 1
-                        if NOTIFY_NEW_GIFTS:
-                            lines = []
-                            for g in new_items[:NEW_NOTIFY_MAX_LINES]:
-                                lines.append(_gift_line(g, you_cap=sniper._user_cap(g)))
-                            more = len(new_items) - len(lines)
-                            tail = f"\n… и ещё {more}" if more > 0 else ""
-                            fire_and_forget(notifier.send(with_star_tail("🆕 Новые подарки:\n" + "\n".join(lines) + tail)))
+                    if new and NOTIFY_NEW_GIFTS:
+                        lines = []
+                        for g in new_items[:NEW_NOTIFY_MAX_LINES]:
+                            lines.append(_gift_line(g, you_cap=sniper._user_cap(g)))
+                        more = len(new_items) - len(lines)
+                        tail = f"\n… и ещё {more}" if more > 0 else ""
+                        fire_and_forget(notifier.send(with_star_tail("🆕 Новые подарки:\n" + "\n".join(lines) + tail)))
+                    if new: hour_new += 1
                     touch_ok()
             except (OSError, ConnectionError) as e:
                 print("[ERR] connection:", e)
@@ -694,7 +773,7 @@ async def main():
                     fire_and_forget(notifier.send(with_star_tail(f"❗ Ошибка цикла: {e!r}")))
                     last_fail_alert = now()
 
-            # heartbeat — с балансом
+            # hourly heartbeat — с балансом
             if NOTIFY_HOURLY and (now() - hour_anchor) >= timedelta(hours=1):
                 ok_total, ok_hour = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
@@ -706,7 +785,7 @@ async def main():
                 ))
                 hour_anchor = now(); reconnects_hour = 0; hour_new = 0; sniper.reset_hour_metrics()
 
-            # daily summary — с балансом
+            # daily summary
             if NOTIFY_DAILY and now() >= (midnight_msk(day_anchor) + timedelta(days=1)):
                 ok_total, _ = sniper.snapshot_fetch_metrics()
                 fire_and_forget(notifier.send(
@@ -716,7 +795,7 @@ async def main():
                 ))
                 day_anchor = midnight_msk(now())
 
-            # сон по режиму
+            # пауза
             if burst_only and not in_burst_state:
                 await asyncio.sleep(2.0)
             else:
