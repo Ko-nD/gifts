@@ -61,8 +61,8 @@ if not BUY_CHANNEL_ID:
 BUY_CHANNEL_FIRST = os.getenv("BUY_CHANNEL_FIRST", "true").lower() in ("1","true","yes","on")
 
 # Фильтры
-P_FROM, P_TO = int(os.getenv("PRICE_LIMIT_FROM", 500)),  int(os.getenv("PRICE_LIMIT_TO", 50_000))
-S_FROM, S_TO = int(os.getenv("SUPPLY_LIMIT_FROM", 1)),   int(os.getenv("SUPPLY_LIMIT_TO", 60_000))
+P_FROM, P_TO = int(os.getenv("PRICE_LIMIT_FROM", 1)),  int(os.getenv("PRICE_LIMIT_TO", 50_000))
+S_FROM, S_TO = int(os.getenv("SUPPLY_LIMIT_FROM", 1)),   int(os.getenv("SUPPLY_LIMIT_TO", 350_000))
 
 # обычный мониторинг
 POLL_MIN = float(os.getenv("POLL_INTERVAL_FROM", "9.5"))
@@ -71,7 +71,7 @@ POLL_MAX = float(os.getenv("POLL_INTERVAL_TO",   "11.5"))
 # бурст-режим
 BURST_EACH_HOUR   = os.getenv("BURST_EACH_HOUR", "true").lower() in ("1","true","yes","on")
 BURST_WINDOWS     = (os.getenv("BURST_WINDOWS") or "").replace(" ", "")
-BURST_POLL_MIN    = float(os.getenv("BURST_POLL_MIN", "1.0"))
+BURST_POLL_MIN    = float(os.getenv("BURST_POLL_MIN", "0.5"))
 BURST_POLL_MAX    = float(os.getenv("BURST_POLL_MAX", "1.5"))
 BURST_PREWARM_SEC = int(os.getenv("BURST_PREWARM_SEC", "45"))
 BURST_FORCE_MINUTES = int(os.getenv("BURST_FORCE_MINUTES", "0"))
@@ -86,7 +86,7 @@ CAP_SECOND_RARE     = int(os.getenv("CAP_SECOND_RARE", "25"))
 
 # баланс звёзд
 STARS_REFRESH_HOURS   = int(os.getenv("STARS_REFRESH_HOURS", "24"))
-STARS_FALLBACK_BAL    = int(os.getenv("STARS_FALLBACK_BALANCE", "10000"))  # ← по умолчанию 10к
+STARS_FALLBACK_BAL    = int(os.getenv("STARS_FALLBACK_BALANCE", "10500"))  # ← по умолчанию 10к
 
 # уведомления (опционально)
 BOT_TOKEN       = (os.getenv("BOT_TOKEN") or "").strip()
